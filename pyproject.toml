@@ -1,0 +1,25 @@
+[project]
+name = "partsight"
+version = "0.1.0"
+description = "Conservative industrial part presence inspection baseline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8,<4",
+    "numpy>=2.0,<3",
+    "opencv-python-headless>=4.8,<5",
+    "pillow>=10,<13",
+    "streamlit>=1.40,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+cache-dir = ".uv-cache"

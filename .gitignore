@@ -153,6 +153,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.uv-cache/
 env/
 venv/
 ENV/
@@ -218,3 +219,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PartSight local data and generated diagnostics
+data/
+*.zip
+outputs/*
+!outputs/.gitkeep
