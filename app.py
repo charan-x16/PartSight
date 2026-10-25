@@ -178,7 +178,9 @@ def main() -> None:
             "Known-good photo for orientation check (optional)",
             choices,
             index=choices.index(default_reference),
-            key="reference_photo",
+            # One widget per photo, so BG_00 is offered again by default after switching photos
+            # (a single key would keep "None" from when BG_00 itself was selected).
+            key=f"reference_photo::{case_dir}::{photo_name}",
             help="A confirmed complete photo of the same assembly from the same viewpoint. Present/absent "
             "decisions always come from the CAD comparison; the known-good photo adds the rotation check.",
         )
