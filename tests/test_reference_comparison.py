@@ -1,13 +1,10 @@
 import cv2
 import numpy as np
-import pytest
-from PIL import Image
 
 from src.reference_comparison import (
     classify_reference_similarity,
     combine_reference_and_baseline,
     compare_reference_region,
-    load_reference_image,
 )
 
 
@@ -16,25 +13,6 @@ def _texture(seed=21, size=96):
     gray = rng.integers(35, 220, (size, size), dtype=np.uint8)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     return np.repeat(gray[..., None], 3, axis=2)
-
-
-def test_load_reference_image_converts_rgba_to_rgb(tmp_path):
-    rgba = np.zeros((12, 18, 4), dtype=np.uint8)
-    rgba[..., 0] = 120
-    rgba[..., 3] = 255
-    path = tmp_path / "reference.png"
-    Image.fromarray(rgba).save(path)
-
-    loaded = load_reference_image(path)
-
-    assert loaded.shape == (12, 18, 3)
-    assert loaded.dtype == np.uint8
-    assert np.all(loaded[..., 0] == 120)
-
-
-def test_load_reference_image_reports_missing_file(tmp_path):
-    with pytest.raises(FileNotFoundError, match="Reference image does not exist"):
-        load_reference_image(tmp_path / "missing.png")
 
 
 def test_region_comparison_handles_small_shift_and_illumination_change():

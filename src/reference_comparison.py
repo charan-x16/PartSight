@@ -12,25 +12,12 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image
 
 from .detector import (
     _annotate,
     inspect_case,
     region_core,
 )
-
-
-def load_reference_image(path: str | Path) -> np.ndarray:
-    """Load a reference image as RGB, including correct RGBA handling."""
-    reference_path = Path(path)
-    if not reference_path.is_file():
-        raise FileNotFoundError(f"Reference image does not exist: {reference_path}")
-    try:
-        with Image.open(reference_path) as image:
-            return np.asarray(image.convert("RGB"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Could not load reference image {reference_path}: {exc}") from exc
 
 
 def _correlation(first: np.ndarray, second: np.ndarray) -> float:
@@ -167,8 +154,8 @@ def best_rotated_reference_similarity(
     partly occluded part (e.g. a washer ring under a nut) lies off that axis,
     and rotating about it displaces the content far beyond any local shift, so
     the centre of the minimum enclosing circle of the outer contour is used.
-    The remaining shift window matches the local localization window of the
-    geometric module (twice its default 12 px position tolerance).
+    The ±24 px shift window covers residual alignment error plus the offset
+    between the circle centre and the true rotation axis.
     """
     mask = np.asarray(region_mask, dtype=bool)
     ys, xs = np.nonzero(mask)
@@ -280,7 +267,6 @@ def inspect_with_real_reference(
     reference_confirmed: bool = False,
     base_result: dict[str, Any] | None = None,
     reference_result: dict[str, Any] | None = None,
-    alignment_method: str = "ecc",
     max_shift_px: int = 6,
     shift_step_px: int = 2,
     missing_threshold: float = 0.20,
@@ -293,7 +279,7 @@ def inspect_with_real_reference(
     """
     directory = Path(case_dir).resolve()
     base = base_result if base_result is not None else inspect_case(
-        directory, photo_name, alignment_method=alignment_method
+        directory, photo_name
     )
     photo_path = directory / photo_name
     reference_path = None if reference_photo is None else Path(reference_photo)
@@ -354,7 +340,7 @@ def inspect_with_real_reference(
         raise ValueError("Reference image must belong to the selected dataset case; cross-case references are disabled.")
 
     reference = reference_result if reference_result is not None else inspect_case(
-        directory, reference_path.name, alignment_method=alignment_method
+        directory, reference_path.name
     )
     if (reference["cad"], reference["mask"]) != (base["cad"], base["mask"]):
         raise ValueError(
@@ -469,7 +455,7 @@ def inspect_with_real_reference(
                         explanation = (
                             f"Local appearance matches the reference after a shift of ({rotation['shift_dx_px']}, "
                             f"{rotation['shift_dy_px']}) px without rotation (similarity {rotation['similarity']:.3f}): "
-                            "the part is present but displaced; see geometric validation."
+                            "the part is present but displaced."
                         )
                     else:
                         explanation = (
@@ -628,5 +614,4 @@ __all__ = [
     "classify_reference_similarity",
     "combine_reference_and_baseline",
     "inspect_with_real_reference",
-    "load_reference_image",
 ]

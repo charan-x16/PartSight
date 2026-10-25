@@ -19,9 +19,6 @@ STATUS_LABELS = {
     "PRESENT": "Present", "MISSING": "Absent", "UNCERTAIN": "Uncertain", "NOT_VISIBLE": "Not visible in CAD",
 }
 STATUS_ORDER = {"MISSING": 0, "UNCERTAIN": 1, "PRESENT": 2, "NOT_VISIBLE": 3}
-# Masked-edge ECC is the only alignment that works on the sample photos; SIFT and
-# LoFTR remain available from the command line (run_inspection.py --alignment).
-ALIGNMENT_METHOD = "ecc"
 
 
 @st.cache_data(ttl=600, max_entries=16)
@@ -236,7 +233,7 @@ def main() -> None:
     if run:
         with st.spinner("Aligning the photo to the CAD and checking every part…"):
             try:
-                result = inspect_case(case_dir, photo_name, alignment_method=ALIGNMENT_METHOD)
+                result = inspect_case(case_dir, photo_name)
                 if reference_photo_name is not None and reference_confirmed:
                     comparison = inspect_with_real_reference(
                         case_dir,
@@ -244,7 +241,6 @@ def main() -> None:
                         reference_photo=reference_photo_name,
                         reference_confirmed=True,
                         base_result=result,
-                        alignment_method=ALIGNMENT_METHOD,
                     )
                     result = add_orientation_check(result, comparison)
                 st.session_state["inspection_result"] = result

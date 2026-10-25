@@ -12,7 +12,7 @@ import hashlib
 import io
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,6 @@ class AlignmentResult:
     overlap_ratio: float | None = None
     match_points: tuple[tuple[float, float, float, float, bool], ...] = ()
     correlation_score: float | None = None
-    foreground_edge_distance_px: float | None = None
 
 
 def extract_part_regions(
@@ -574,55 +573,7 @@ def _alignment_record(result: AlignmentResult) -> dict[str, Any]:
         "projected_area_ratio": result.projected_area_ratio,
         "overlap_ratio": result.overlap_ratio,
         "correlation_score": result.correlation_score,
-        "foreground_edge_distance_px": result.foreground_edge_distance_px,
     }
-
-
-def foreground_edge_distance(aligned_rgb: np.ndarray, cad_rgb: np.ndarray, mask_ids: np.ndarray) -> float | None:
-    """Median distance (CAD px) from CAD edges in the part foreground to aligned-photo edges.
-
-    This is a label-free registration check measured where parts are inspected,
-    independent of the correspondences used to estimate the homography.
-    """
-
-    import cv2
-
-    foreground = cv2.dilate((np.asarray(mask_ids) > 0).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
-    cad_edges = (cv2.Canny(cv2.cvtColor(cad_rgb, cv2.COLOR_RGB2GRAY), 50, 140) > 0) & foreground
-    real_edges = cv2.Canny(cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2GRAY), 50, 140)
-    if not cad_edges.any() or not real_edges.any():
-        return None
-    distance = cv2.distanceTransform((real_edges == 0).astype(np.uint8), cv2.DIST_L2, 3)
-    return float(np.median(distance[cad_edges]))
-
-
-def _match_visualization(photo_rgb: np.ndarray, cad_rgb: np.ndarray, result: AlignmentResult) -> np.ndarray:
-    """Create a compact side-by-side view of filtered matches and RANSAC inliers."""
-
-    photo = Image.fromarray(photo_rgb)
-    cad = Image.fromarray(cad_rgb)
-    max_height = 900
-    photo.thumbnail((1200, max_height))
-    cad.thumbnail((1200, max_height))
-    header = 48
-    canvas = Image.new("RGB", (photo.width + cad.width, max(photo.height, cad.height) + header), "#171b20")
-    canvas.paste(photo, (0, header))
-    canvas.paste(cad, (photo.width, header))
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default(size=22)
-    draw.text((10, 10), f"{result.method}: filtered matches; green=inlier, red=outlier", font=font, fill="white")
-    draw.text((photo.width + 8, 12), "CAD", font=font, fill="white")
-    photo_sx, photo_sy = photo.width / photo_rgb.shape[1], photo.height / photo_rgb.shape[0]
-    cad_sx, cad_sy = cad.width / cad_rgb.shape[1], cad.height / cad_rgb.shape[0]
-    for px, py, cx, cy, is_inlier in result.match_points:
-        source = (int(px * photo_sx), int(py * photo_sy + header))
-        target = (int(cx * cad_sx + photo.width), int(cy * cad_sy + header))
-        color = (40, 220, 80) if is_inlier else (245, 70, 60)
-        draw.line((source, target), fill=color, width=2)
-        radius = 5
-        draw.ellipse((source[0]-radius, source[1]-radius, source[0]+radius, source[1]+radius), outline=color, width=2)
-        draw.ellipse((target[0]-radius, target[1]-radius, target[0]+radius, target[1]+radius), outline=color, width=2)
-    return np.asarray(canvas)
 
 
 def classify_regions(
@@ -646,16 +597,10 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
     colors = {
         "PRESENT": (20, 185, 70), "ROTATED": (60, 140, 255),
         "MISSING": (230, 45, 45), "UNCERTAIN": (245, 170, 20),
-        "WITHIN_TOLERANCE": (20, 185, 70), "OUT_OF_TOLERANCE": (230, 45, 45),
-        "NOT_MEASURABLE": (245, 170, 20), "NOT_APPLICABLE": (150, 150, 150),
     }
-    geometry_labels = {
-        "WITHIN_TOLERANCE": "OK", "OUT_OF_TOLERANCE": "OUT",
-        "NOT_MEASURABLE": "N/M", "NOT_APPLICABLE": "N/A",
-    }
-    short_labels = {**geometry_labels, "MISSING": "A"}
+    # Absent parts are labelled "A"; the others by their first letter.
+    short_labels = {"MISSING": "A"}
     legend_names = {"MISSING": "ABSENT"}
-    geometry_mode = any(record["status"] in geometry_labels for record in records)
     occupied_cad: list[tuple[int, int, int, int]] = []
     occupied_photo: list[tuple[int, int, int, int]] = []
 
@@ -697,8 +642,6 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
             and region.largest_component_area / max(region.area, 1) < 0.10
         )
         label = f"{region.stencil_value} {short_labels.get(outcome, outcome[0])}"
-        if result.get("deviation_axes"):
-            label += f" {result['deviation_axes'].replace('orientation', 'rot').replace('position', 'pos')}"
         if not fragmented:
             label_centroid = region.largest_component_centroid or region.centroid
             draw_label(
@@ -730,12 +673,12 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
                     (photo.width, photo.height),
                 )
     legend_font = ImageFont.load_default(size=max(16, font_size - 2))
-    shown = list(geometry_labels) if geometry_mode else ["PRESENT", "MISSING", "UNCERTAIN"]
+    shown = ["PRESENT", "MISSING", "UNCERTAIN"]
     if any(record.get("inspection_outcome") == "ROTATED" for record in records):
         shown.insert(1, "ROTATED")
     legend_rows = tuple((status, colors[status]) for status in shown)
     for canvas, draw in ((cad, draw_cad), (photo, draw_photo)):
-        legend_width, row_height, margin = (330 if geometry_mode else 230), 27, 10
+        legend_width, row_height, margin = 230, 27, 10
         legend_height = row_height * len(legend_rows) + 2 * margin
         draw.rectangle((8, 8, 8 + legend_width, 8 + legend_height), fill=(20, 24, 30))
         for row, (status, color) in enumerate(legend_rows):
@@ -748,15 +691,8 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
     return np.asarray(cad), np.asarray(photo)
 
 
-def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str = "ecc") -> dict[str, Any]:
-    """Run alignment and part-level baseline inspection for a dataset case.
-
-    ``alignment_method``: ``"ecc"`` (default) registers photo and CAD edges
-    with masked-edge ECC and falls back to SIFT only if ECC fails; ``"sift"``
-    tries SIFT keypoints first; ``"loftr"`` tries LoFTR and keeps it only if it
-    registers the CAD foreground better than ECC. Photo-to-render keypoint
-    matching (SIFT) fails on the sample photos, so it is not the default.
-    """
+def inspect_case(case_dir: str | Path, photo_name: str) -> dict[str, Any]:
+    """Align a real photo to its CAD image and decide presence for every listed part."""
 
     directory = Path(case_dir).resolve()
     files = resolve_case_files(directory, photo_name)
@@ -785,74 +721,16 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
             f"{mask_info.width}x{mask_info.height}"
         )
     regions = extract_part_regions(mask_ids, mappings)
-    if alignment_method not in {"ecc", "sift", "loftr"}:
-        raise ValueError("alignment_method must be 'ecc', 'sift', or 'loftr'.")
+    # Masked-edge ECC registers photo and CAD edges inside the assembly; keypoint
+    # matching (SIFT) between a real photo and a rendered CAD image fails on the
+    # sample data, so it is only tried when ECC fails.
     attempted_alignments: list[AlignmentResult] = []
-    alignment: AlignmentResult
-    aligned: np.ndarray | None
-    if alignment_method == "loftr":
-        from .loftr_alignment import align_loftr_ransac
-
-        loftr_alignment, loftr_aligned = align_loftr_ransac(photo_rgb, cad_rgb)
-        if loftr_alignment.success and loftr_aligned is not None:
-            # Passing RANSAC checks does not show that the homography registers
-            # the inspected parts: sparse photo-to-render matches can be few and
-            # clustered. Compare it with masked-edge ECC on the same label-free
-            # foreground edge distance and keep the better registration.
-            loftr_alignment = replace(
-                loftr_alignment,
-                foreground_edge_distance_px=foreground_edge_distance(loftr_aligned, cad_rgb, mask_ids),
-            )
-            attempted_alignments.append(loftr_alignment)
-            alignment, aligned = loftr_alignment, loftr_aligned
-            ecc_alignment, ecc_aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
-            if ecc_alignment.success and ecc_aligned is not None:
-                ecc_alignment = replace(
-                    ecc_alignment,
-                    foreground_edge_distance_px=foreground_edge_distance(ecc_aligned, cad_rgb, mask_ids),
-                )
-            attempted_alignments.append(ecc_alignment)
-            if (
-                ecc_alignment.success
-                and ecc_alignment.foreground_edge_distance_px is not None
-                and (
-                    loftr_alignment.foreground_edge_distance_px is None
-                    or ecc_alignment.foreground_edge_distance_px < loftr_alignment.foreground_edge_distance_px
-                )
-            ):
-                LOGGER.info(
-                    "Selected ECC over LoFTR for %s: foreground edge distance %.2f px vs %s px.",
-                    photo_name,
-                    ecc_alignment.foreground_edge_distance_px,
-                    loftr_alignment.foreground_edge_distance_px,
-                )
-                alignment, aligned = ecc_alignment, ecc_aligned
-        else:
-            attempted_alignments.append(loftr_alignment)
-            alignment, aligned = loftr_alignment, loftr_aligned
-        if not alignment.success:
-            LOGGER.warning("LoFTR failed for %s: %s; trying SIFT then ECC.", photo_name, alignment.reason)
-            sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
-            attempted_alignments.append(sift_alignment)
-            alignment, aligned = sift_alignment, sift_aligned
-    elif alignment_method == "sift":
-        sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
-        attempted_alignments.append(sift_alignment)
-        alignment, aligned = sift_alignment, sift_aligned
-    else:
-        ecc_alignment, ecc_aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
-        attempted_alignments.append(ecc_alignment)
-        alignment, aligned = ecc_alignment, ecc_aligned
-        if not alignment.success:
-            LOGGER.warning("ECC failed for %s: %s; trying SIFT.", photo_name, alignment.reason)
-            sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
-            attempted_alignments.append(sift_alignment)
-            alignment, aligned = sift_alignment, sift_aligned
-    if not alignment.success and alignment_method != "ecc":
-        ecc_alignment, ecc_aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
-        attempted_alignments.append(ecc_alignment)
-        if ecc_alignment.success:
-            alignment, aligned = ecc_alignment, ecc_aligned
+    alignment, aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
+    attempted_alignments.append(alignment)
+    if not alignment.success:
+        LOGGER.warning("ECC failed for %s: %s; trying SIFT.", photo_name, alignment.reason)
+        alignment, aligned = align_sift_ransac(photo_rgb, cad_rgb)
+        attempted_alignments.append(alignment)
     if not alignment.success:
         # Retain whichever failure provides the stronger geometric diagnostic.
         alignment = max(
@@ -868,11 +746,6 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
         aligned = None
     records = classify_regions(regions, aligned, cad_rgb, alignment)
     cad_annotated, photo_annotated = _annotate(cad_rgb, photo_rgb, regions, records, alignment)
-    match_visualizations = {
-        attempt.method.lower(): _match_visualization(photo_rgb, cad_rgb, attempt)
-        for attempt in attempted_alignments
-        if attempt.match_points
-    }
     return {
         "case": directory.name,
         "photo": photo_path.name,
@@ -891,9 +764,8 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
             "aligned": aligned,
             "photo_annotated": photo_annotated,
             "cad_annotated": cad_annotated,
-            "match_visualizations": match_visualizations,
-            # Internal computation context shared with geometric validation;
-            # image arrays and matrices are excluded by result_json().
+            # Internal context reused by the orientation check; image arrays
+            # and matrices are excluded by result_json().
             "mask_ids": mask_ids,
             "regions": regions,
             "matrix_photo_to_cad": alignment.matrix_photo_to_cad,

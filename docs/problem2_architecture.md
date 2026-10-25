@@ -40,7 +40,7 @@ flowchart TD
 
 ## Why these design choices (evidence from the prototype)
 
-A 2D prototype of stages 3–5 (`src/geometric.py`) was run on the sample photos. Its results shaped the design.
+An earlier 2D prototype of stages 3–5 was run on the sample photos (it is no longer in the codebase). Its results shaped the design.
 
 | Observation on the sample photos | Design consequence |
 |---|---|

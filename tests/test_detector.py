@@ -94,27 +94,6 @@ def test_alignment_failure_makes_every_part_uncertain():
     assert "too few matches" in results[0]["diagnostic"]
 
 
-def test_loftr_alignment_reports_missing_optional_dependencies(monkeypatch):
-    import builtins
-
-    original_import = builtins.__import__
-
-    def without_loftr(name, *args, **kwargs):
-        if name == "torch" or name.startswith("kornia"):
-            raise ImportError(name)
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", without_loftr)
-    from src.loftr_alignment import align_loftr_ransac
-
-    image = np.zeros((32, 32, 3), dtype=np.uint8)
-    alignment, aligned = align_loftr_ransac(image, image)
-
-    assert not alignment.success
-    assert aligned is None
-    assert "optional dependencies" in alignment.reason
-
-
 def test_csv_and_json_reports_include_part_evidence_only():
     result = {
         "case": "case-a",
@@ -290,66 +269,6 @@ def test_stray_mask_fragments_do_not_contribute_local_presence_evidence():
     assert noisy["component_count"] > 20
     assert noisy["status"] == clean["status"] != "PRESENT"
     assert noisy["diagnostic"] == clean["diagnostic"]
-
-
-def test_foreground_edge_distance_increases_with_misregistration():
-    from src.detector import foreground_edge_distance
-
-    cad = np.zeros((160, 160, 3), dtype=np.uint8)
-    cv2.rectangle(cad, (40, 40), (120, 120), (220, 220, 220), -1)
-    mask = np.zeros((160, 160), dtype=np.uint8)
-    mask[40:121, 40:121] = 1
-    shifted = np.roll(cad, (9, 9), axis=(0, 1))
-
-    assert foreground_edge_distance(cad, cad, mask) == 0.0
-    assert foreground_edge_distance(shifted, cad, mask) >= 5.0
-
-
-def _run_loftr_with_fake_matches(monkeypatch, points):
-    import pytest
-
-    torch = pytest.importorskip("torch")
-    KF = pytest.importorskip("kornia.feature")
-
-    class FakeLoFTR:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def eval(self):
-            return self
-
-        def to(self, device):
-            return self
-
-        def __call__(self, batch):
-            tensor = torch.from_numpy(points)
-            return {"keypoints0": tensor, "keypoints1": tensor.clone(), "confidence": torch.ones(len(points))}
-
-    monkeypatch.setattr(KF, "LoFTR", FakeLoFTR)
-    from src.loftr_alignment import align_loftr_ransac
-
-    image = np.zeros((240, 320, 3), dtype=np.uint8)
-    return align_loftr_ransac(image, image)
-
-
-def test_loftr_rejects_nearly_collinear_inliers(monkeypatch):
-    xs = np.linspace(10, 300, 40)
-    points = np.column_stack((xs, 100 + 3 * np.sin(xs))).astype(np.float32)
-
-    alignment, aligned = _run_loftr_with_fake_matches(monkeypatch, points)
-
-    assert not alignment.success and aligned is None
-    assert "nearly collinear" in alignment.reason
-
-
-def test_loftr_accepts_well_spread_inliers(monkeypatch):
-    grid = np.stack(np.meshgrid(np.linspace(20, 300, 8), np.linspace(20, 220, 6)), axis=-1)
-    points = grid.reshape(-1, 2).astype(np.float32)
-
-    alignment, aligned = _run_loftr_with_fake_matches(monkeypatch, points)
-
-    assert alignment.success, alignment.reason
-    assert np.allclose(alignment.matrix_photo_to_cad, np.eye(3), atol=1e-3)
 
 
 def test_fixed_mask_regions_are_cached_read_only_and_keyed_by_content():
