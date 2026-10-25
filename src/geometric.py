@@ -39,7 +39,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .data_inspection import load_part_mapping
 from .detector import (
     AlignmentResult,
     PartRegion,
@@ -47,7 +46,6 @@ from .detector import (
     align_sift_ransac,
     foreground_edge_distance,
     inspect_case,
-    largest_component_mask as _largest_component,
     region_core,
     result_csv,
     result_json,
@@ -703,7 +701,7 @@ def inspect_geometry_case(
     size_tolerance_ratio: float = 0.10,
     orientation_tolerance_deg: float = 5.0,
     base_result: dict[str, Any] | None = None,
-    alignment_method: str = "sift",
+    alignment_method: str = "ecc",
     reference_photo: str | Path | None = None,
     reference_confirmed: bool = False,
     reference_result: dict[str, Any] | None = None,
@@ -767,17 +765,7 @@ def inspect_geometry_case(
         cad_registration_uncertainty = foreground_edge_distance(images["aligned"], images["cad"], images["mask_ids"])
     cad_registration_uncertainty = float(cad_registration_uncertainty or 0.0)
 
-    json_path = next(iter(sorted(case_path.glob("*.json"))), None)
-    if json_path is None:
-        raise FileNotFoundError(f"No JSON part mapping found in {case_path}")
-    mapping_groups = load_part_mapping(json_path)
-    if not mapping_groups:
-        raise ValueError(f"JSON mapping has no part entries in {json_path}")
-    # The first mapping group is the one inspect_case resolved for this case.
-    mapping = next(iter(mapping_groups.values()))
-    from .detector import extract_part_regions
-
-    regions: list[PartRegion] = extract_part_regions(images["mask_ids"], mapping)
+    regions: list[PartRegion] = images["regions"]
     presence_by_value = {row["pixel_value"]: row for row in presence["parts"]}
     tolerances = {
         "position_tolerance_px": position_tolerance_px,

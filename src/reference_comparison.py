@@ -14,15 +14,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .data_inspection import load_part_mapping
 from .detector import (
     _annotate,
-    extract_part_regions,
     inspect_case,
-    largest_component_mask,
     region_core,
-    result_csv,
-    result_json,
 )
 
 
@@ -285,7 +280,7 @@ def inspect_with_real_reference(
     reference_confirmed: bool = False,
     base_result: dict[str, Any] | None = None,
     reference_result: dict[str, Any] | None = None,
-    alignment_method: str = "sift",
+    alignment_method: str = "ecc",
     max_shift_px: int = 6,
     shift_step_px: int = 2,
     missing_threshold: float = 0.20,
@@ -361,6 +356,11 @@ def inspect_with_real_reference(
     reference = reference_result if reference_result is not None else inspect_case(
         directory, reference_path.name, alignment_method=alignment_method
     )
+    if (reference["cad"], reference["mask"]) != (base["cad"], base["mask"]):
+        raise ValueError(
+            f"Reference photo {reference_path.name} belongs to a different assembly "
+            f"({reference['cad']}, {reference['mask']}); choose a photo of the same assembly."
+        )
     target_aligned = base["images"].get("aligned")
     reference_aligned = reference["images"].get("aligned")
     alignment_valid = bool(
@@ -370,14 +370,7 @@ def inspect_with_real_reference(
         and reference_aligned is not None
         and target_aligned.shape[:2] == reference_aligned.shape[:2]
     )
-    json_paths = sorted(directory.glob("*.json"))
-    if not json_paths:
-        raise FileNotFoundError(f"No JSON part mapping found in {directory}")
-    mapping_groups = load_part_mapping(json_paths[0])
-    if not mapping_groups:
-        raise ValueError(f"JSON part mapping has no entries in {json_paths[0]}")
-    mapping = next(iter(mapping_groups.values()))
-    regions = extract_part_regions(base["images"]["mask_ids"], mapping)
+    regions = base["images"]["regions"]
     reference_features = None
     if alignment_valid:
         # The reference is reused for every inspected photo; derive it once.
@@ -583,7 +576,53 @@ def inspect_with_real_reference(
     }
 
 
+def add_orientation_check(base: dict[str, Any], comparison: dict[str, Any]) -> dict[str, Any]:
+    """Mark CAD-present parts that a confirmed known-good photo shows rotated.
+
+    Present/absent decisions stay those of the CAD comparison (``base``). The
+    known-good photo comparison only adds an orientation note: a part it
+    matches only after rotating the reference is shown as present but rotated.
+    """
+    reference = comparison.get("reference", {})
+    if not reference.get("alignment_verified"):
+        warning = reference.get("warning") or "The known-good photo could not be verified as aligned with this photo."
+        return {**base, "reference": {"warning": f"Orientation check skipped: {warning}"}}
+    by_value = {row["pixel_value"]: row for row in comparison["parts"]}
+    parts = []
+    for row in base["parts"]:
+        checked = by_value.get(row["pixel_value"], {})
+        part = {**row, "inspection_outcome": row["status"]}
+        rotation = checked.get("reference_rotation_deg")
+        if row["status"] == "PRESENT" and checked.get("inspection_outcome") == "ROTATED" and rotation is not None:
+            angle = (float(rotation) + 180.0) % 360.0 - 180.0
+            direction = "counter-clockwise" if angle > 0 else "clockwise"
+            part.update(
+                inspection_outcome="ROTATED",
+                reference_rotation_deg=rotation,
+                diagnostic=(
+                    f"{row['diagnostic']} Rotated about {abs(angle):.0f} deg {direction} compared with "
+                    f"the known-good photo {reference.get('photo')}."
+                ),
+            )
+        parts.append(part)
+    cad_annotated, photo_annotated = _annotate(
+        base["images"]["cad"], base["images"]["photo"], base["images"]["regions"], parts,
+        base["images"]["alignment_result"],
+    )
+    return {
+        **base,
+        "parts": parts,
+        "orientation_check": {"reference_photo": reference.get("photo")},
+        "outcome_counts": {
+            outcome: sum(part["inspection_outcome"] == outcome for part in parts)
+            for outcome in ("PRESENT", "ROTATED", "MISSING", "UNCERTAIN", "NOT_VISIBLE")
+        },
+        "images": {**base["images"], "photo_annotated": photo_annotated, "cad_annotated": cad_annotated},
+    }
+
+
 __all__ = [
+    "add_orientation_check",
     "best_rotated_reference_similarity",
     "compare_reference_region",
     "classify_reference_similarity",

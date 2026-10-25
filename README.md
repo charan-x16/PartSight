@@ -1,6 +1,6 @@
 # PartSight
 
-PartSight compares real assembly photographs with CAD references and part-ID masks. The app provides **Part Presence Inspection** and **Geometric Validation** modes. The default alignment remains SIFT/RANSAC followed by masked-edge ECC; an optional LoFTR/RANSAC experiment is available from the CLI.
+PartSight checks a real photograph of an assembly against its CAD image, part-ID mask, and part list. **Part Presence Inspection** (Problem Statement 1) decides for every part in the JSON whether it is present or absent in the photo and highlights the result on both images. Problem Statement 2 (position, orientation, and size) is answered by the architecture in [`docs/problem2_architecture.md`](docs/problem2_architecture.md), informed by a command-line geometry prototype.
 
 ## Setup and run
 
@@ -16,28 +16,32 @@ Launch the Streamlit interface with:
 uv run streamlit run app.py
 ```
 
-The command-line inspection runs the existing presence and geometry modes by default. Use `--mode reference` to run the experimental real-photo comparison, or `--mode all` for all three. Reference results are written under `outputs/inspection/reference/`; baseline and geometry outputs retain their existing paths. The reference experiment compares local normalized intensity and gradient structure after each real photo is aligned into CAD coordinates, allowing a small translation search.
+The command line writes per-photo results (`results.csv`, `results.json`, annotated real and CAD images) under `outputs/inspection/<mode>/<case>/<photo>/`. `--mode presence` runs Problem 1 only; the default also runs geometry, and `--mode all` adds the optional known-good-photo comparison.
 
-Try LoFTR alignment for the full dataset with:
+## Part presence (Problem 1)
 
-```powershell
-uv pip install torch kornia
-uv run python scripts/run_inspection.py --mode presence --alignment loftr --output outputs/inspection/loftr
-```
+Inputs per case: the real photo, the CAD image, the part-ID mask, and the JSON part list. No other photo is needed. Two file layouts are recognised:
 
-LoFTR is optional because PyTorch adds a large platform-specific dependency and the pretrained outdoor weights may need to download on first use. If dependencies, weights, or alignment checks are unavailable, the command logs the reason and falls back to SIFT and ECC. LoFTR inliers that are nearly collinear are rejected because the homography is unconstrained away from them. An accepted LoFTR homography is also compared with masked-edge ECC on a label-free registration score (median distance from CAD foreground edges to aligned-photo edges, `foreground_edge_distance_px`), and the better registration is used. On the sample data ECC scores better for every photograph. This is a matcher comparison, not evidence that presence detection is accurate.
+- **Sample data layout:** one folder per case with `BG_*` real photos, an `FG_*` CAD image, one JSON (`{"<mask file>": [{"Name": ..., "StencilValue": ...}]}`), and the mask it names (or the folder's only `*mask*` file).
+- **Assignment naming:** `<name>_Real.<ext>`, `<name>_CAD.<ext>`, `<name>_Mask.<ext>`, `<name>_PartNamesToPixelMap.json`; several `<name>` sets may share one folder.
 
-Presence results no longer accept global RANSAC inliers alone as proof that a component is present. For positive local edge evidence, the pipeline attempts a bounded local silhouette fit and reports image-space `position_offset_*_px` and `position_deviation` fields. A part can be present but outside the positional tolerance; this is a geometric deviation, not a missing-part label. Weak or ambiguous localization remains `UNCERTAIN`.
+The JSON may also be a plain `{"<part name>": <pixel value>}` map or a list of parts. A pixel value is a scalar ID (read from the single mask channel that carries IDs) or an RGB colour `[r, g, b]` matched exactly in a colour mask. Point the app's sidebar "Dataset folder", or `run_inspection.py --dataset-root`, at another folder to inspect other data.
 
-For the main case, `--mode reference` uses `BG_00.png` as a **provisional** reference. Its completeness is not confirmed by the supplied data. Therefore the default run leaves final reference-mode statuses `UNCERTAIN`, but records proposed candidate statuses for evaluation. Only pass `--reference-confirmed` after an operator verifies the chosen same-case reference is complete. Override the reference filename with `--reference-photo <filename>`. TestCase2 never borrows the main-case reference and falls back to the existing baseline unless a same-case reference is explicitly added to the code/UI selection.
+1. **Align** the photo to the CAD with masked-edge ECC, which registers the edges of the photo and the CAD inside the assembly area. Keypoint matching (SIFT) between a real photo and a rendered CAD image fails on the sample data, so it is only a fallback (`--alignment sift` tries it first). Optional LoFTR alignment (`--alignment loftr`, needs `uv pip install torch kornia`) is kept only when it registers the CAD edges better than ECC.
+2. **Locate** each part from its main region in the mask; stray boundary pixels are ignored. Parts with no pixels, or fewer than 400 px, in the CAD view are reported `NOT_VISIBLE` (hidden in the CAD view) and are not guessed.
+3. **Measure four local cues** at the part's expected location in the aligned photo: outline support (CAD edges matched by photo edges within 3 px, allowing a ±16 px local shift), edge density, texture, and contrast with the surrounding ring.
+4. **Decide.** A blank region is absent. Otherwise the part is compared with its same-type parts in the same photo (names that differ only in a trailing number, e.g. `large_washer_1`..`_5`): if its cues relative to theirs combine to below 0.6, it is absent, whatever removed or covered it. A part with no same-type part is present when at least 50% of its CAD outline is found, otherwise uncertain. A rotated part is present.
+5. **Display.** Present parts are outlined in green and absent parts in red, at their expected location, on both the real and the CAD image. A table gives each part's result and reason.
 
-Reference comparison uses each part's largest connected mask component and skips parts under 400 px, as the CAD baseline does. A part that differs from the reference is re-compared with the reference rotated about the part's axis, taken as the centre of the minimum enclosing circle of its outline (5 degree steps, within a +/-24 px window). The centroid is not used because a partly hidden part, such as a washer under a nut, has its centroid off the axis. If a rotation matches, the part keeps `status` `PRESENT` and gets `inspection_outcome` `ROTATED`. `inspection_outcome` keeps present, rotated, missing and uncertain distinct in the CSV, the Streamlit table and the annotations. A confirmed reference is only used when the rest of the photo also matches it (median part similarity at least the present limit); otherwise the photo is treated as not correctly aligned and reference statuses stay `UNCERTAIN`. With a confirmed reference, a part may be reported `MISSING` without baseline agreement only when no tested shift or rotation brings it above the missing similarity limit and the rest of the photo still matches the reference. CAD-edge evidence alone cannot reject a part whose region is covered by unrelated texture.
+The decision limits were chosen by inspecting the sample images and have no independent validation. Known limits: a part type whose instances are all missing cannot be judged against siblings; parts hidden in the CAD view cannot be checked; results depend on the photo being taken from roughly the CAD viewpoint.
 
-For Problem 1, `outputs/inspection/intended_defects.csv` lists the defects deliberately introduced into the three test images, verified by pixel-differencing against `BG_00.png`. Running `--mode reference --reference-confirmed` writes `problem1_defect_report.md`, scoring each defect as detected, missed or uncertain and listing any unchanged part that was flagged. `tests/test_problem1_defects.py` checks the same cases and is skipped without the sample data.
+`outputs/inspection/intended_defects.csv` lists the expected absent parts (deliberate edits to the main test images and the manually reviewed TestCase2 bolts). `run_inspection.py` writes `problem1_report.md`, which scores every checked part against these expectations; every unlisted part is expected to be present.
 
-The command writes `outputs/inspection/reference_comparison_report.md` when `manual_validation.csv` is available. This compares the baseline with proposed reference candidates on the unchanged visual-review rows; it is not an accuracy estimate. The Streamlit app keeps its two inspection modes and adds a presence evidence selector for the baseline or real-photo reference method.
+**Optional orientation check.** When a confirmed complete photo of the same assembly is available (the app's "Known-good photo for orientation check", or `--mode all --reference-confirmed --reference-photo <file>`), each present part is also compared with it, including a rotation search; parts that match only after rotating are shown as present but rotated (blue), with the angle. Present/absent decisions still come from the CAD comparison, and the photo is used only when the rest of it matches the reference.
 
 ## Geometric validation (Problem 2)
+
+The proposed architecture for checking location and dimensions against the CAD is in [`docs/problem2_architecture.md`](docs/problem2_architecture.md). The rest of this section describes the 2D prototype in `src/geometric.py` whose results informed that design.
 
 Geometry outcomes are separate from presence: `WITHIN_TOLERANCE`, `OUT_OF_TOLERANCE`, `NOT_MEASURABLE` and `NOT_APPLICABLE`. `NOT_APPLICABLE` means the part is reported missing, so its geometry is never called correct. Position, orientation and size each get a value, an uncertainty and a result (`WITHIN`, `OUT`, `INCONCLUSIVE`, `NOT_OBSERVABLE` or `NOT_MEASURABLE`), and any `OUT` axis, including orientation, makes the part `OUT_OF_TOLERANCE`. A tolerance decision is made only when value ± uncertainty is entirely on one side of the tolerance; otherwise the part is `NOT_MEASURABLE` with the reason.
 
@@ -46,9 +50,9 @@ Geometry outcomes are separate from presence: `WITHIN_TOLERANCE`, `OUT_OF_TOLERA
 - **CAD-relative** (no confirmed reference): the CAD outline is fitted to photo edges after global alignment, and the global registration error is added to the position uncertainty. On the sample photos this is mostly `NOT_MEASURABLE` for rotation and scale, because outline-to-edge fits are ambiguous there.
 - **Reference-relative** (confirmed same-viewpoint known-good photo, e.g. `--reference-confirmed` with `BG_00.png`): presence comes from the confirmed-reference comparison, the photos are registered directly (SIFT/RANSAC), and each part's appearance is matched against the reference part. This cancels CAD-placement and height offsets shared with the reference, but viewpoint changes between the photos are modelled only by the photo-to-photo registration. A part that presence found rotated beyond the local search range gets its orientation from that rotation search (±2.5°).
 
-Geometry mode in the app uses the selected alignment method and an optional confirmed reference photo, and shows outcome counts and per-axis deviation counts.
+The prototype runs from the command line (`run_inspection.py --mode geometry`); the app covers Problem 1 only.
 
-`uv run python scripts/run_geometry_validation.py` builds semi-synthetic cases from the confirmed `BG_00.png`. Fastener groups are found from the mask and pasted back with known shifts, rotations and scale changes, or removed, with all other parts as unchanged controls. The ground truth goes to `outputs/geometry_validation/geometry_validation.csv`, scored results to `geometry_validation_results.csv`, and a summary to `geometry_validation_report.md`. Pasted patches rotate their shading with them and are resampled, so these results do not establish accuracy on physically displaced parts. `scripts/local_alignment_experiment.py` tests local rigid-surface re-alignment around each fastener; on the sample photos it did not reduce offsets and is not used.
+Local rigid-surface re-alignment around each fastener was tested and did not reduce offsets on the sample photos, so it is not used.
 
 Run unit tests with:
 
@@ -64,8 +68,6 @@ $env:UV_HTTP_RETRIES = "8"
 uv sync
 ```
 
-## Baseline limits
+## Notes
 
-The supplied masks decode as RGB `uint8` with part IDs in the red channel. The detector reads `StencilValue` and `Name` from each case's JSON mapping. Presence decisions use local edge correspondence and contrast evidence; a successful global alignment alone is never treated as proof of presence. Geometric validation is described above; its values are image-space estimates, not millimetres, and it has only semi-synthetic validation. Neither mode is validated against real ground-truth measurements. Reflections, occlusion, perspective, different assembly depths, and fragmented mask IDs remain limitations; review results manually.
-
-`scripts/inspect_dataset.py` remains available for dataset and mask diagnostics. Source utilities are in `src/data_inspection.py`, `src/visualization.py`, `src/detector.py`, and `src/geometric.py`. Local data and generated outputs are ignored by Git.
+The supplied masks decode as RGB `uint8` with part IDs in the red channel; part names and IDs come from each case's JSON (`Name`, `StencilValue`). Geometry prototype values are image-space estimates, not millimetres. Local data and generated outputs are ignored by Git.

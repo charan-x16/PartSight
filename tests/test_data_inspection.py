@@ -8,7 +8,6 @@ from PIL import Image
 
 from src.data_inspection import (
     PartMapping,
-    compare_mapping_to_mask,
     inspect_mask,
     load_image,
     load_part_mapping,
@@ -109,13 +108,49 @@ def test_ambiguous_multichannel_mask_is_not_guessed():
     assert result["selected_value_counts"] is None
 
 
-def test_compare_mapping_reports_absent_and_unmapped_values():
-    mask_stats = inspect_mask(np.array([[0, 1], [1, 5]], dtype=np.uint8))
-    mappings = [PartMapping("present", 1), PartMapping("absent", 2)]
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"washer_1": 3, "nut_1": 7},
+        [{"name": "washer_1", "pixel_value": 3}, {"name": "nut_1", "pixel_value": 7}],
+        {"parts": [{"Name": "washer_1", "StencilValue": 3}, {"Name": "nut_1", "StencilValue": 7}]},
+    ],
+)
+def test_flat_and_list_part_lists_are_accepted(tmp_path, payload):
+    path = tmp_path / "Sample_PartNamesToPixelMap.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
-    result = compare_mapping_to_mask(mappings, mask_stats)
+    mapping = load_part_mapping(path)
 
-    assert result["absent_mapped_parts"] == [
-        {"name": "absent", "stencil_value": 2, "node_id": None}
-    ]
-    assert result["unmapped_mask_values"] == [5]
+    assert [(part.name, part.stencil_value) for part in mapping[""]] == [("washer_1", 3), ("nut_1", 7)]
+
+
+def test_rgb_part_colours_become_ids_in_the_mask(tmp_path):
+    from src.data_inspection import load_image, mask_part_ids
+
+    path = tmp_path / "Sample_PartNamesToPixelMap.json"
+    path.write_text(json.dumps({"washer_1": [255, 0, 0], "nut_1": [0, 0, 255]}), encoding="utf-8")
+    parts = load_part_mapping(path)[""]
+    mask = np.zeros((4, 4, 3), np.uint8)
+    mask[0, 0] = (255, 0, 0)
+    mask[3, 3] = (0, 0, 255)
+    Image.fromarray(mask).save(tmp_path / "Sample_Mask.png")
+
+    ids = mask_part_ids(load_image(tmp_path / "Sample_Mask.png"), parts)
+
+    assert parts[0].color == (255, 0, 0) and ids[0, 0] == parts[0].stencil_value
+    assert ids[3, 3] == parts[1].stencil_value and ids[1, 1] == 0
+
+
+def test_assignment_file_naming_is_resolved_per_photo(tmp_path):
+    from src.data_inspection import discover_photos, resolve_case_files
+
+    for name in ("A_Real.jpeg", "A_CAD.png", "A_Mask.png", "B_Real.jpeg", "B_CAD.png", "B_Mask.png"):
+        Image.fromarray(np.zeros((4, 4, 3), np.uint8)).save(tmp_path / name)
+    for prefix in ("A", "B"):
+        (tmp_path / f"{prefix}_PartNamesToPixelMap.json").write_text(json.dumps({"part_1": 1}), encoding="utf-8")
+
+    files = resolve_case_files(tmp_path, "B_Real.jpeg")
+
+    assert [photo.name for photo in discover_photos(tmp_path)] == ["A_Real.jpeg", "B_Real.jpeg"]
+    assert (files.cad.name, files.mask.name, files.mapping.name) == ("B_CAD.png", "B_Mask.png", "B_PartNamesToPixelMap.json")

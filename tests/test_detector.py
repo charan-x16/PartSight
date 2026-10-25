@@ -10,7 +10,6 @@ from src.detector import (
     align_masked_edges_ecc,
     align_sift_ransac,
     classify_regions,
-    classify_part_measurements,
     extract_part_regions,
     result_csv,
     result_json,
@@ -58,7 +57,7 @@ def test_extract_part_region_reports_disconnected_components_and_union_geometry(
     assert region.largest_component_centroid == (1.5, 1.5)
 
 
-def test_highly_fragmented_geometry_remains_uncertain():
+def test_highly_fragmented_part_is_reported_not_visible_in_cad():
     mask = np.zeros((40, 40), dtype=np.uint8)
     for y in range(2, 38, 4):
         for x in range(2, 38, 4):
@@ -70,8 +69,8 @@ def test_highly_fragmented_geometry_remains_uncertain():
     result = classify_regions(region, image, image, alignment)[0]
 
     assert region[0].component_count > 20
-    assert result["status"] == "UNCERTAIN"
-    assert "highly fragmented" in result["diagnostic"]
+    assert result["status"] == "NOT_VISIBLE"
+    assert "visible in the CAD view" in result["diagnostic"]
 
 
 def test_extract_red_channel_from_multichannel_mask():
@@ -95,75 +94,6 @@ def test_alignment_failure_makes_every_part_uncertain():
     assert "too few matches" in results[0]["diagnostic"]
 
 
-def test_global_matching_inliers_alone_do_not_prove_local_part_presence():
-    regions = extract_part_regions(
-        np.array([[0, 1, 1], [0, 1, 0]], dtype=np.uint8),
-        [PartMapping("part", 1)],
-    )
-    alignment = AlignmentResult(
-        True,
-        np.eye(3),
-        "ok",
-        good_matches=12,
-        inliers=10,
-        inlier_ratio=10 / 12,
-        cad_inlier_points=((1.0, 0.0), (1.0, 1.0)),
-    )
-
-    result = classify_regions(
-        regions, np.zeros((2, 3, 3), np.uint8), np.zeros((2, 3, 3), np.uint8), alignment
-    )[0]
-
-    assert result["status"] == "UNCERTAIN"
-    assert "Too little per-part" in result["diagnostic"]
-
-
-def test_global_feature_matches_are_not_positive_classification_evidence():
-    result = classify_part_measurements(
-        area=1200,
-        matching_inliers=6,
-        cad_std=20.0,
-        real_std=12.0,
-        real_to_ring_mean_delta=10.0,
-        cad_edge_density=0.03,
-        real_edge_density=0.02,
-        edge_support=0.15,
-    )
-    assert result["status"] == "UNCERTAIN"
-
-
-def test_localized_part_is_flagged_when_silhouette_is_displaced(monkeypatch):
-    import src.geometric as geometric
-
-    mask = np.zeros((80, 80), dtype=np.uint8)
-    mask[20:60, 20:60] = 1
-    image = np.zeros((80, 80, 3), dtype=np.uint8)
-    image[20:60, 20:60] = 180
-    region = extract_part_regions(mask, [PartMapping("nut", 1)])[0]
-    alignment = AlignmentResult(
-        True, np.eye(3), "ok", cad_inlier_points=((25.0, 25.0), (50.0, 50.0))
-    )
-    monkeypatch.setattr(
-        geometric,
-        "measure_local_component_geometry",
-        lambda *_args, **_kwargs: {
-            "measurable": True,
-            "edge_support": 0.80,
-            "position_offset_dx_px": 14.0,
-            "position_offset_dy_px": -5.0,
-            "position_offset_magnitude_px": float(np.hypot(14, 5)),
-            "position_out_of_tolerance": True,
-        },
-    )
-
-    result = classify_regions([region], image, image, alignment)[0]
-
-    assert result["status"] == "PRESENT"
-    assert result["position_deviation"] is True
-    assert result["position_offset_dx_px"] == 14.0
-    assert "outside the 12 px tolerance" in result["diagnostic"]
-
-
 def test_loftr_alignment_reports_missing_optional_dependencies(monkeypatch):
     import builtins
 
@@ -183,65 +113,6 @@ def test_loftr_alignment_reports_missing_optional_dependencies(monkeypatch):
     assert not alignment.success
     assert aligned is None
     assert "optional dependencies" in alignment.reason
-
-
-def test_flat_region_heuristic_can_report_missing_only_with_cad_structure():
-    result = classify_part_measurements(
-        area=900,
-        matching_inliers=0,
-        cad_std=25.0,
-        real_std=4.0,
-        real_to_ring_mean_delta=1.5,
-        cad_edge_density=0.04,
-        real_edge_density=0.001,
-    )
-
-    assert result["status"] == "MISSING"
-    assert "heuristic" in result["evidence"]
-
-
-def test_local_edge_correspondence_is_positive_presence_evidence():
-    result = classify_part_measurements(
-        area=1600,
-        matching_inliers=0,
-        cad_std=25.0,
-        real_std=22.0,
-        real_to_ring_mean_delta=18.0,
-        cad_edge_density=0.04,
-        real_edge_density=0.03,
-        edge_support=0.72,
-    )
-    assert result["status"] == "PRESENT"
-    assert "72%" in result["evidence"]
-
-
-def test_weak_local_evidence_abstains():
-    result = classify_part_measurements(
-        area=1600,
-        matching_inliers=0,
-        cad_std=24.0,
-        real_std=14.0,
-        real_to_ring_mean_delta=8.0,
-        cad_edge_density=0.04,
-        real_edge_density=0.025,
-        edge_support=0.18,
-    )
-    assert result["status"] == "UNCERTAIN"
-
-
-def test_clear_local_edge_absence_with_flat_blended_photo_is_missing_evidence():
-    result = classify_part_measurements(
-        area=1800,
-        matching_inliers=0,
-        cad_std=13.0,
-        real_std=0.3,
-        real_to_ring_mean_delta=0.2,
-        cad_edge_density=0.025,
-        real_edge_density=0.0,
-        edge_support=0.0,
-    )
-    assert result["status"] == "MISSING"
-    assert "Possible absence" in result["evidence"]
 
 
 def test_csv_and_json_reports_include_part_evidence_only():
@@ -276,7 +147,7 @@ def test_empty_mask_region_is_not_reported_missing():
 
     result = classify_regions(regions, np.zeros((8, 8, 3), np.uint8), np.zeros((8, 8, 3), np.uint8), alignment)[0]
 
-    assert result["status"] == "UNCERTAIN"
+    assert result["status"] == "NOT_VISIBLE"
     assert result["bbox_xyxy"] is None
     assert "no pixels" in result["diagnostic"].lower()
     assert result["component_count"] == 0

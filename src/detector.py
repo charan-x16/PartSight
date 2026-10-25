@@ -19,9 +19,18 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .data_inspection import PartMapping, inspect_mask, load_image, load_part_mapping
+from .data_inspection import (
+    PartMapping,
+    discover_case_directories,
+    discover_photos,
+    load_image,
+    load_part_mapping,
+    mask_part_ids,
+    resolve_case_files,
+)
 
 LOGGER = logging.getLogger(__name__)
+PRESENCE_STATUSES = ("PRESENT", "MISSING", "UNCERTAIN", "NOT_VISIBLE")
 
 # Fixed per-case data (CAD image, mask, mask regions) is identical for every
 # photograph of a case, so it is computed once and shared read-only. Each
@@ -616,244 +625,14 @@ def _match_visualization(photo_rgb: np.ndarray, cad_rgb: np.ndarray, result: Ali
     return np.asarray(canvas)
 
 
-def _matching_inlier_count(region: PartRegion, alignment: AlignmentResult) -> int:
-    if region.bbox is None:
-        return 0
-    x0, y0, x1, y1 = region.bbox
-    return sum(
-        1 for x, y in alignment.cad_inlier_points
-        if x0 <= x < x1 and y0 <= y < y1
-        and region.binary_mask[min(int(y), region.binary_mask.shape[0] - 1), min(int(x), region.binary_mask.shape[1] - 1)]
-    )
-
-
-def classify_part_measurements(
-    area: int,
-    matching_inliers: int,
-    cad_std: float,
-    real_std: float,
-    real_to_ring_mean_delta: float,
-    cad_edge_density: float,
-    real_edge_density: float,
-    edge_support: float = 0.0,
-) -> dict[str, Any]:
-    """Classify a part from local appearance evidence, with a high abstain rate."""
-
-    if area >= 500 and cad_edge_density >= 0.012 and edge_support >= 0.42:
-        return {
-            "status": "PRESENT",
-            "score": min(0.90, 0.55 + edge_support * 0.35),
-            "evidence": f"Local CAD-to-photo edge support is {edge_support:.0%} within the expected part mask.",
-        }
-    if area < 400:
-        return {"status": "UNCERTAIN", "score": 0.25, "evidence": "Too little per-part feature evidence for a safe decision."}
-    # CAD masks for thin/flat washer surfaces can have modest grayscale spread;
-    # require a measurable expected edge signal as an alternative indicator.
-    has_cad_structure = (cad_std >= 18.0 or cad_edge_density >= 0.015)
-    visually_flat = real_std < 9.0 and real_edge_density < 0.006
-    blends_into_background = real_to_ring_mean_delta < 4.0
-    if (
-        area >= 500
-        and blends_into_background
-        and has_cad_structure
-        and visually_flat
-        and edge_support < 0.08
-    ):
-        return {
-            "status": "MISSING",
-            "score": 0.60,
-            "evidence": (
-                "Possible absence: CAD has structure, but the aligned region is low-texture, "
-                "blends into its local ring, and has under 8% local edge support. This is a heuristic."
-            ),
-        }
-    return {
-        "status": "UNCERTAIN",
-        "score": min(0.49, max(0.20, edge_support * 0.5)),
-        "evidence": (
-            f"Ambiguous local evidence: edge support={edge_support:.0%}, "
-            f"edge density photo/CAD={real_edge_density:.3f}/{cad_edge_density:.3f}, "
-            f"part-to-ring contrast={real_to_ring_mean_delta:.1f} gray levels."
-        ),
-    }
-
-
-def _part_evidence(
-    region: PartRegion,
-    aligned_rgb: np.ndarray,
-    cad_rgb: np.ndarray,
-    alignment: AlignmentResult,
-    image_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
-) -> dict[str, Any]:
-    import cv2
-
-    if region.area == 0:
-        return {"status": "UNCERTAIN", "score": 0.0, "evidence": "Mapped value has no pixels in the CAD mask."}
-    largest_fraction = region.largest_component_area / region.area
-    if region.component_count > 20 and largest_fraction < 0.10:
-        return {
-            "status": "UNCERTAIN",
-            "score": 0.15,
-            "evidence": (
-                f"Mask geometry is highly fragmented ({region.component_count} connected components; "
-                f"largest contains {largest_fraction:.1%} of mapped pixels), so part-local evidence is unreliable."
-            ),
-        }
-    matching_inliers = _matching_inlier_count(region, alignment)
-    # Missing is only emitted with reliable alignment, a sizable mask, and
-    # simultaneous evidence that the CAD part is textured/contrasting while
-    # the corresponding real region is flat and blends into its surroundings.
-    if region.area < 400 or region.bbox is None:
-        return {"status": "UNCERTAIN", "score": 0.25, "evidence": "Too little per-part feature evidence for a safe decision."}
-    # Rendered masks contain small stray IDs on boundaries between other
-    # parts. Measuring evidence around those fragments scores edges belonging
-    # to neighbouring parts, so local evidence uses the dominant component.
-    inside = region_core(region)
-    core_area = int(np.count_nonzero(inside))
-    if core_area < 400:
-        return {
-            "status": "UNCERTAIN",
-            "score": 0.25,
-            "evidence": f"Largest connected mask component has only {core_area} px; too little per-part evidence.",
-        }
-    if image_stats is None:
-        cad_gray = cv2.cvtColor(cad_rgb, cv2.COLOR_RGB2GRAY)
-        real_gray = cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2GRAY)
-        cad_edges = cv2.Canny(cad_gray, 50, 140)
-        real_edges = cv2.Canny(real_gray, 50, 140)
-    else:
-        real_gray, cad_gray, real_edges, cad_edges = image_stats
-    ring = cv2.dilate(inside.astype(np.uint8), np.ones((19, 19), np.uint8), iterations=1).astype(bool) & ~inside
-    if not ring.any():
-        return {"status": "UNCERTAIN", "score": 0.2, "evidence": "No usable local background ring for comparison."}
-    cad_part_std = float(cad_gray[inside].std())
-    real_part_std = float(real_gray[inside].std())
-    real_ring_mean = float(real_gray[ring].mean())
-    real_part_mean = float(real_gray[inside].mean())
-    cad_edge_density = float(np.count_nonzero(cad_edges[inside])) / core_area
-    real_edge_density = float(np.count_nonzero(real_edges[inside])) / core_area
-    # Chamfer-style edge correspondence is less sensitive to brightness and
-    # small residual registration error than raw pixel differences. Restrict
-    # both edge sets to the mapped part (with a narrow margin) so rug/background
-    # texture cannot provide positive evidence by itself.
-    tolerance = max(4, min(16, int(round(np.sqrt(core_area) * 0.06))))
-    margin = cv2.dilate(inside.astype(np.uint8), np.ones((2 * tolerance + 1, 2 * tolerance + 1), np.uint8)).astype(bool)
-    cad_part_edges = (cad_edges > 0) & margin
-    real_part_edges = (real_edges > 0) & margin
-    if cad_part_edges.any() and real_part_edges.any():
-        distance_to_real = cv2.distanceTransform((~real_part_edges).astype(np.uint8), cv2.DIST_L2, 3)
-        edge_support = float(np.mean(distance_to_real[cad_part_edges] <= tolerance))
-    else:
-        edge_support = 0.0
-    evidence = classify_part_measurements(
-        core_area,
-        0,
-        cad_part_std,
-        real_part_std,
-        abs(real_part_mean - real_ring_mean),
-        cad_edge_density,
-        real_edge_density,
-        edge_support,
-    )
-    # Global alignment inliers can fall inside a part mask even when the part
-    # itself is displaced: background texture and nearby assembly structure
-    # can support the same homography. Before accepting a positive local edge
-    # score, fit the expected silhouette in a bounded local neighborhood.
-    geometry: dict[str, Any] | None = None
-    if matching_inliers >= 2 or evidence["status"] == "PRESENT":
-        try:
-            from .geometric import measure_local_component_geometry
-
-            geometry = measure_local_component_geometry(
-                inside.astype(np.uint8),
-                aligned_rgb,
-                np.eye(3, dtype=np.float32),
-                position_tolerance_px=12.0,
-            )
-        except (ImportError, ValueError, cv2.error) as exc:
-            geometry = {"measurable": False, "reason": f"Local silhouette fit failed: {exc}"}
-    if evidence["status"] == "PRESENT":
-        if geometry and geometry.get("measurable") and geometry.get("edge_support", 0.0) >= 0.42:
-            dx = float(geometry["position_offset_dx_px"])
-            dy = float(geometry["position_offset_dy_px"])
-            offset = float(geometry["position_offset_magnitude_px"])
-            if geometry.get("position_out_of_tolerance"):
-                evidence["evidence"] += (
-                    f" Local silhouette is displaced by ({dx:.1f}, {dy:.1f}) px "
-                    f"({offset:.1f} px total), outside the 12 px tolerance."
-                )
-            else:
-                evidence["evidence"] += f" Local silhouette offset is {offset:.1f} px, within 12 px tolerance."
-        else:
-            evidence = {
-                "status": "UNCERTAIN",
-                "score": min(float(evidence["score"]), 0.49),
-                "evidence": (
-                    "Global alignment or permissive edge overlap suggested presence, but the part silhouette "
-                    "could not be independently localized; "
-                    f"{geometry.get('reason', 'local shape fit was inconclusive') if geometry else 'no local fit was run'}."
-                ),
-            }
-    if geometry is not None:
-        evidence["local_geometry"] = geometry
-    return evidence
-
-
 def classify_regions(
     regions: list[PartRegion], aligned_rgb: np.ndarray | None, cad_rgb: np.ndarray, alignment: AlignmentResult
 ) -> list[dict[str, Any]]:
-    """Return one cautious status record for every mapped part."""
+    """Return one present/absent record for every mapped part (see ``presence``)."""
 
-    image_stats = None
-    if alignment.success and aligned_rgb is not None and any(
-        region.area >= 400 and _matching_inlier_count(region, alignment) < 2
-        for region in regions
-    ):
-        import cv2
+    from .presence import classify_presence
 
-        cad_gray = cv2.cvtColor(cad_rgb, cv2.COLOR_RGB2GRAY)
-        real_gray = cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2GRAY)
-        image_stats = (
-            real_gray,
-            cad_gray,
-            cv2.Canny(real_gray, 50, 140),
-            cv2.Canny(cad_gray, 50, 140),
-        )
-    records: list[dict[str, Any]] = []
-    for region in regions:
-        if not alignment.success or aligned_rgb is None:
-            evidence = {"status": "UNCERTAIN", "score": 0.0, "evidence": f"Alignment failed: {alignment.reason}"}
-        else:
-            evidence = _part_evidence(region, aligned_rgb, cad_rgb, alignment, image_stats)
-        records.append({
-            "part_name": region.name,
-            "pixel_value": region.stencil_value,
-            "status": evidence["status"],
-            "evidence_score": evidence["score"],
-            "mask_area_px": region.area,
-            "component_count": region.component_count,
-            "largest_component_area_px": region.largest_component_area,
-            "largest_component_fraction": (
-                region.largest_component_area / region.area if region.area else 0.0
-            ),
-            "largest_component_bbox_xyxy": (
-                list(region.largest_component_bbox) if region.largest_component_bbox else None
-            ),
-            "largest_component_centroid_xy": (
-                list(region.largest_component_centroid)
-                if region.largest_component_centroid
-                else None
-            ),
-            "bbox_xyxy": list(region.bbox) if region.bbox else None,
-            "centroid_xy": list(region.centroid) if region.centroid else None,
-            "diagnostic": evidence["evidence"],
-            "position_offset_dx_px": (evidence.get("local_geometry") or {}).get("position_offset_dx_px"),
-            "position_offset_dy_px": (evidence.get("local_geometry") or {}).get("position_offset_dy_px"),
-            "position_offset_magnitude_px": (evidence.get("local_geometry") or {}).get("position_offset_magnitude_px"),
-            "position_deviation": (evidence.get("local_geometry") or {}).get("position_out_of_tolerance"),
-            "localization_edge_support": (evidence.get("local_geometry") or {}).get("edge_support"),
-        })
-    return records
+    return classify_presence(regions, aligned_rgb, cad_rgb, alignment)
 
 
 def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegion], records: list[dict[str, Any]], alignment: AlignmentResult) -> tuple[np.ndarray, np.ndarray]:
@@ -870,11 +649,13 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
         "WITHIN_TOLERANCE": (20, 185, 70), "OUT_OF_TOLERANCE": (230, 45, 45),
         "NOT_MEASURABLE": (245, 170, 20), "NOT_APPLICABLE": (150, 150, 150),
     }
-    short_labels = {
+    geometry_labels = {
         "WITHIN_TOLERANCE": "OK", "OUT_OF_TOLERANCE": "OUT",
         "NOT_MEASURABLE": "N/M", "NOT_APPLICABLE": "N/A",
     }
-    geometry_mode = any(record["status"] in short_labels for record in records)
+    short_labels = {**geometry_labels, "MISSING": "A"}
+    legend_names = {"MISSING": "ABSENT"}
+    geometry_mode = any(record["status"] in geometry_labels for record in records)
     occupied_cad: list[tuple[int, int, int, int]] = []
     occupied_photo: list[tuple[int, int, int, int]] = []
 
@@ -898,13 +679,14 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
             occupied.append(rect)
             return
     for region, result in zip(regions, records, strict=True):
-        if region.bbox is None:
-            continue
         outcome = result.get("inspection_outcome", result["status"])
+        # Parts hidden in the CAD view cannot be checked and are listed only in the results table.
+        if region.bbox is None or outcome == "NOT_VISIBLE":
+            continue
         color = colors[outcome]
-        x0, y0, x1, y1 = region.bbox
+        # Outline the part's main region; stray boundary IDs in the mask would only add clutter.
         contours, _ = cv2.findContours(
-            region.binary_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            region_core(region).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         for contour in contours:
             cad_points = [(int(point[0][0]), int(point[0][1])) for point in contour]
@@ -939,18 +721,6 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
             photo_center = cv2.perspectiveTransform(center, inverse)[0, 0]
             if not fragmented and np.isfinite(photo_center).all():
                 px, py = (int(value) for value in photo_center)
-                dx = result.get("position_offset_dx_px")
-                dy = result.get("position_offset_dy_px")
-                if result.get("position_deviation") and dx is not None and dy is not None:
-                    observed_center_cad = np.float32(
-                        [[[label_centroid[0] + float(dx), label_centroid[1] + float(dy)]]]
-                    )
-                    observed_center_photo = cv2.perspectiveTransform(observed_center_cad, inverse)[0, 0]
-                    if np.isfinite(observed_center_photo).all():
-                        ox, oy = (int(value) for value in observed_center_photo)
-                        draw_photo.line((px, py, ox, oy), fill=(255, 40, 40), width=4)
-                        radius = max(7, font_size // 2)
-                        draw_photo.ellipse((ox - radius, oy - radius, ox + radius, oy + radius), outline=(255, 40, 40), width=4)
                 draw_label(
                     draw_photo,
                     label,
@@ -960,7 +730,7 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
                     (photo.width, photo.height),
                 )
     legend_font = ImageFont.load_default(size=max(16, font_size - 2))
-    shown = list(short_labels) if geometry_mode else ["PRESENT", "MISSING", "UNCERTAIN"]
+    shown = list(geometry_labels) if geometry_mode else ["PRESENT", "MISSING", "UNCERTAIN"]
     if any(record.get("inspection_outcome") == "ROTATED" for record in records):
         shown.insert(1, "ROTATED")
     legend_rows = tuple((status, colors[status]) for status in shown)
@@ -971,56 +741,52 @@ def _annotate(cad_rgb: np.ndarray, photo_rgb: np.ndarray, regions: list[PartRegi
         for row, (status, color) in enumerate(legend_rows):
             top = 8 + margin + row * row_height
             draw.rectangle((18, top + 4, 36, top + 20), fill=color)
-            draw.text((44, top), status, font=legend_font, fill="white")
+            draw.text((44, top), legend_names.get(status, status), font=legend_font, fill="white")
     if not alignment.success:
         draw_photo.rectangle((8, 8, min(photo.width - 8, 1250), font_size * 2 + 18), fill=(130, 15, 15))
         draw_photo.text((16, 14), "ALIGNMENT FAILED — all part statuses are UNCERTAIN", font=font, fill="white")
     return np.asarray(cad), np.asarray(photo)
 
 
-def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str = "sift") -> dict[str, Any]:
-    """Run alignment and part-level baseline inspection for a dataset case."""
+def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str = "ecc") -> dict[str, Any]:
+    """Run alignment and part-level baseline inspection for a dataset case.
+
+    ``alignment_method``: ``"ecc"`` (default) registers photo and CAD edges
+    with masked-edge ECC and falls back to SIFT only if ECC fails; ``"sift"``
+    tries SIFT keypoints first; ``"loftr"`` tries LoFTR and keeps it only if it
+    registers the CAD foreground better than ECC. Photo-to-render keypoint
+    matching (SIFT) fails on the sample photos, so it is not the default.
+    """
 
     directory = Path(case_dir).resolve()
-    json_paths = sorted(directory.glob("*.json"))
-    if not json_paths:
-        raise FileNotFoundError(f"No JSON mapping found in {directory}")
-    groups = load_part_mapping(json_paths[0])
-    if not groups:
-        raise ValueError(f"No part mapping entries in {json_paths[0]}")
-    declared_mask = next(iter(groups))
-    mask_path = directory / declared_mask
-    if not mask_path.exists():
-        candidates = sorted(p for p in directory.iterdir() if p.is_file() and "mask" in p.stem.lower())
-        if len(candidates) != 1:
-            raise FileNotFoundError(f"Cannot uniquely resolve mask '{declared_mask}' in {directory}")
-        mask_path = candidates[0]
-    photo_path = directory / photo_name
-    cad_path = next((p for p in directory.glob("FG_*.*") if p.is_file()), None)
-    if cad_path is None:
-        raise FileNotFoundError(f"No FG CAD reference image in {directory}")
+    files = resolve_case_files(directory, photo_name)
+    photo_path, cad_path, mask_path = files.photo, files.cad, files.mask
     photo_info = load_image(photo_path)
     photo_rgb = np.asarray(Image.fromarray(photo_info.array).convert("RGB"))
-    fixed_key = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in (cad_path, mask_path))
+    fixed_key = tuple(
+        (str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in (cad_path, mask_path, files.mapping)
+    )
     fixed = _FIXED_INPUT_CACHE.get(fixed_key)
     if fixed is None:
+        mappings = load_part_mapping(files.mapping)[files.mapping_group]
+        if not mappings:
+            raise ValueError(f"No parts in {files.mapping}")
         cad_info, mask_info = load_image(cad_path), load_image(mask_path)
         cad_rgb = _read_only(np.array(Image.fromarray(cad_info.array).convert("RGB")))
         _read_only(mask_info.array)
-        fixed = _remember(_FIXED_INPUT_CACHE, fixed_key, (cad_rgb, mask_info, inspect_mask(mask_info)))
-    cad_rgb, mask_info, mask_stats = fixed
+        mask_ids = mask_part_ids(mask_info, mappings)
+        if mask_ids.flags.writeable:
+            _read_only(mask_ids)
+        fixed = _remember(_FIXED_INPUT_CACHE, fixed_key, (cad_rgb, mask_info, mask_ids, mappings))
+    cad_rgb, mask_info, mask_ids, mappings = fixed
     if mask_info.array.shape[:2] != cad_rgb.shape[:2]:
         raise ValueError(
             f"CAD image and part mask dimensions differ: {cad_rgb.shape[1]}x{cad_rgb.shape[0]} vs "
             f"{mask_info.width}x{mask_info.height}"
         )
-    channel = mask_stats["selected_channel_index"]
-    if channel is None:
-        raise ValueError("Mask channels are ambiguous; refusing to guess part IDs.")
-    mask_ids = mask_info.array if mask_info.array.ndim == 2 else mask_info.array[..., int(channel)]
-    regions = extract_part_regions(mask_ids, groups[declared_mask])
-    if alignment_method not in {"sift", "loftr"}:
-        raise ValueError("alignment_method must be 'sift' or 'loftr'.")
+    regions = extract_part_regions(mask_ids, mappings)
+    if alignment_method not in {"ecc", "sift", "loftr"}:
+        raise ValueError("alignment_method must be 'ecc', 'sift', or 'loftr'.")
     attempted_alignments: list[AlignmentResult] = []
     alignment: AlignmentResult
     aligned: np.ndarray | None
@@ -1069,28 +835,37 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
             sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
             attempted_alignments.append(sift_alignment)
             alignment, aligned = sift_alignment, sift_aligned
-    else:
+    elif alignment_method == "sift":
         sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
         attempted_alignments.append(sift_alignment)
         alignment, aligned = sift_alignment, sift_aligned
-    if not alignment.success:
+    else:
+        ecc_alignment, ecc_aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
+        attempted_alignments.append(ecc_alignment)
+        alignment, aligned = ecc_alignment, ecc_aligned
+        if not alignment.success:
+            LOGGER.warning("ECC failed for %s: %s; trying SIFT.", photo_name, alignment.reason)
+            sift_alignment, sift_aligned = align_sift_ransac(photo_rgb, cad_rgb)
+            attempted_alignments.append(sift_alignment)
+            alignment, aligned = sift_alignment, sift_aligned
+    if not alignment.success and alignment_method != "ecc":
         ecc_alignment, ecc_aligned = align_masked_edges_ecc(photo_rgb, cad_rgb, mask_ids)
         attempted_alignments.append(ecc_alignment)
         if ecc_alignment.success:
             alignment, aligned = ecc_alignment, ecc_aligned
-        else:
-            # Retain whichever failure provides the stronger geometric diagnostic.
-            alignment = max(
+    if not alignment.success:
+        # Retain whichever failure provides the stronger geometric diagnostic.
+        alignment = max(
             attempted_alignments,
-                key=lambda result: (
-                    result.homography_valid,
-                    result.inliers,
-                    result.inlier_spread_ratio or 0.0,
-                    result.inlier_ratio,
-                    result.correlation_score or 0.0,
-                ),
-            )
-            aligned = None
+            key=lambda result: (
+                result.homography_valid,
+                result.inliers,
+                result.inlier_spread_ratio or 0.0,
+                result.inlier_ratio,
+                result.correlation_score or 0.0,
+            ),
+        )
+        aligned = None
     records = classify_regions(regions, aligned, cad_rgb, alignment)
     cad_annotated, photo_annotated = _annotate(cad_rgb, photo_rgb, regions, records, alignment)
     match_visualizations = {
@@ -1108,7 +883,7 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
             "attempts": [_alignment_record(attempt) for attempt in attempted_alignments],
         },
         "parts": records,
-        "counts": {status: sum(part["status"] == status for part in records) for status in ("PRESENT", "MISSING", "UNCERTAIN")},
+        "counts": {status: sum(part["status"] == status for part in records) for status in PRESENCE_STATUSES},
         "images": {
             "photo": photo_rgb,
             "cad": cad_rgb,
@@ -1120,6 +895,7 @@ def inspect_case(case_dir: str | Path, photo_name: str, *, alignment_method: str
             # Internal computation context shared with geometric validation;
             # image arrays and matrices are excluded by result_json().
             "mask_ids": mask_ids,
+            "regions": regions,
             "matrix_photo_to_cad": alignment.matrix_photo_to_cad,
             "alignment_result": alignment,
         },
@@ -1146,12 +922,6 @@ def result_csv(result: dict[str, Any]) -> str:
 
 def discover_inspection_photos(dataset_root: str | Path) -> list[tuple[Path, str]]:
     """List (case directory, photo filename) pairs supported by the dataset."""
-    from .data_inspection import discover_case_directories, SUPPORTED_IMAGE_SUFFIXES
 
     root = Path(dataset_root).resolve()
-    return [
-        (case_dir, photo.name)
-        for case_dir in discover_case_directories(root)
-        for photo in sorted(case_dir.glob("BG_*.*"))
-        if photo.is_file() and photo.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
-    ]
+    return [(case_dir, photo.name) for case_dir in discover_case_directories(root) for photo in discover_photos(case_dir)]

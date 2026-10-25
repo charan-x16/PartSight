@@ -1,16 +1,21 @@
-"""Dataset discovery and validation utilities for PartSight Phase 1."""
+"""Loading and resolving real photos, CAD images, part masks, and part lists."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+# "<name>_Real.jpeg" with "<name>_CAD.png", "<name>_Mask.png", "<name>_PartNamesToPixelMap.json".
+_REAL_PHOTO = re.compile(r"^(?P<prefix>.+?)_real(?:[_\- ].*)?$", re.IGNORECASE)
+_NAME_KEYS = ("Name", "name", "part_name", "PartName", "part")
+_VALUE_KEYS = ("StencilValue", "stencil_value", "pixel_value", "PixelValue", "pixel", "value", "color", "colour")
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,9 @@ class PartMapping:
     name: str
     stencil_value: int
     node_id: int | str | None = None
+    # Set when the JSON gives the part's mask colour instead of a scalar ID;
+    # ``stencil_value`` is then an index assigned in JSON order.
+    color: tuple[int, int, int] | None = None
 
 
 def load_image(path: str | Path) -> ImageInfo:
@@ -76,8 +84,59 @@ def load_image(path: str | Path) -> ImageInfo:
     )
 
 
+def _part_value(value: Any, where: str) -> int | tuple[int, int, int]:
+    if isinstance(value, bool):
+        raise ValueError(f"{where} has an invalid pixel value {value!r}")
+    if isinstance(value, int) and value >= 0:
+        return value
+    if (
+        isinstance(value, (list, tuple)) and len(value) in (3, 4)
+        and all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 255 for v in value)
+    ):
+        return tuple(value[:3])
+    raise ValueError(f"{where} has an invalid pixel value {value!r}")
+
+
+def _parse_parts(entries: Any, where: str) -> list[PartMapping]:
+    """Parse ``[{name, value}, ...]`` or ``{name: value}`` into part mappings."""
+    if isinstance(entries, dict):
+        pairs = [(name, value, None) for name, value in entries.items()]
+    elif isinstance(entries, list):
+        pairs = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ValueError(f"Entry {index} in {where} must be an object")
+            name = next((entry[key] for key in _NAME_KEYS if key in entry), None)
+            value = next((entry[key] for key in _VALUE_KEYS if key in entry), None)
+            pairs.append((name, value, entry.get("NodeId", entry.get("node_id"))))
+    else:
+        raise ValueError(f"{where} must be a list of parts or a name-to-value object")
+    values = []
+    for index, (name, value, _) in enumerate(pairs):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Entry {index} in {where} has an invalid part name")
+        values.append(_part_value(value, f"Entry {index} ('{name}') in {where}"))
+    colours = [isinstance(value, tuple) for value in values]
+    if any(colours) and not all(colours):
+        raise ValueError(f"{where} mixes scalar IDs and RGB colours")
+    if len(set(values)) != len(values):
+        raise ValueError(f"Duplicate pixel value in {where}")
+    if values and all(colours):
+        return [
+            PartMapping(name.strip(), index + 1, node_id, value)
+            for index, ((name, _, node_id), value) in enumerate(zip(pairs, values))
+        ]
+    return [PartMapping(name.strip(), value, node_id) for (name, _, node_id), value in zip(pairs, values)]
+
+
 def load_part_mapping(path: str | Path) -> dict[str, list[PartMapping]]:
-    """Load and validate the supplied mask-to-parts JSON mapping."""
+    """Load a part list JSON as ``{mask file name or "": [PartMapping, ...]}``.
+
+    Accepted layouts: ``{"<mask file>": [{"Name": ..., "StencilValue": ...}]}``
+    (the sample data), ``{"<part name>": <value>}``, a plain list of part
+    objects, or ``{"parts": [...]}``. A value is a scalar mask ID or an RGB
+    colour ``[r, g, b]``.
+    """
 
     json_path = Path(path)
     if not json_path.is_file():
@@ -86,35 +145,96 @@ def load_part_mapping(path: str | Path) -> dict[str, list[PartMapping]]:
         raw = json.loads(json_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in '{json_path}': {exc}") from exc
+    if isinstance(raw, dict) and isinstance(raw.get("parts"), (list, dict)) and len(raw) == 1:
+        raw = raw["parts"]
+    if not raw:
+        raise ValueError(f"No parts in mapping JSON '{json_path}'")
+    if isinstance(raw, dict) and all(isinstance(entries, list) and all(isinstance(e, dict) for e in entries) for entries in raw.values()):
+        return {str(mask_name): _parse_parts(entries, f"'{mask_name}'") for mask_name, entries in raw.items()}
+    return {"": _parse_parts(raw, f"'{json_path.name}'")}
 
-    if not isinstance(raw, dict) or not raw:
-        raise ValueError("Mapping JSON must be a non-empty object keyed by mask filename")
 
-    result: dict[str, list[PartMapping]] = {}
-    for mask_name, entries in raw.items():
-        if not isinstance(mask_name, str) or not mask_name.strip():
-            raise ValueError("Every mapping key must be a non-empty mask filename")
-        if not isinstance(entries, list):
-            raise ValueError(f"Mapping for '{mask_name}' must be a list")
-        parsed: list[PartMapping] = []
-        seen_values: set[int] = set()
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, dict):
-                raise ValueError(f"Entry {index} for '{mask_name}' must be an object")
-            name = entry.get("Name")
-            value = entry.get("StencilValue")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"Entry {index} for '{mask_name}' has an invalid Name")
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(
-                    f"Entry {index} for '{mask_name}' has an invalid StencilValue"
-                )
-            if value in seen_values:
-                raise ValueError(f"Duplicate StencilValue {value} for '{mask_name}'")
-            seen_values.add(value)
-            parsed.append(PartMapping(name.strip(), value, entry.get("NodeId")))
-        result[mask_name] = parsed
-    return result
+@dataclass(frozen=True)
+class CaseFiles:
+    """Files that belong to one real photo: CAD image, part mask, and part list."""
+
+    photo: Path
+    cad: Path
+    mask: Path
+    mapping: Path
+    mapping_group: str
+
+
+def is_real_photo(path: Path) -> bool:
+    """``BG_*`` photos (sample data layout) or ``<name>_Real*`` photos."""
+    if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+        return False
+    return path.stem.upper().startswith("BG_") or bool(_REAL_PHOTO.match(path.stem))
+
+
+def discover_photos(case_dir: str | Path) -> list[Path]:
+    return sorted(path for path in Path(case_dir).iterdir() if is_real_photo(path))
+
+
+def resolve_case_files(case_dir: str | Path, photo_name: str | Path) -> CaseFiles:
+    """Find the CAD image, mask, and part list for a real photo.
+
+    ``<name>_Real*.<ext>`` uses ``<name>_CAD.*``, ``<name>_Mask.*`` and
+    ``<name>_PartNamesToPixelMap.json`` from the same folder. Otherwise the
+    folder layout of the sample data applies: the folder's JSON, the mask it
+    names (or the folder's only ``*mask*`` file), and ``FG_*`` as the CAD image.
+    """
+    directory = Path(case_dir).resolve()
+    photo = directory / photo_name
+    match = _REAL_PHOTO.match(photo.stem)
+    if match and not photo.stem.upper().startswith("BG_"):
+        prefix = match["prefix"].lower()
+        files = [path for path in directory.iterdir() if path.is_file()]
+
+        def named(kind: str, suffixes: set[str]) -> Path:
+            found = [p for p in files if p.stem.lower() == f"{prefix}_{kind.lower()}" and p.suffix.lower() in suffixes]
+            if len(found) != 1:
+                raise FileNotFoundError(f"Expected one '{match['prefix']}_{kind}' file next to {photo.name} in {directory}")
+            return found[0]
+
+        return CaseFiles(
+            photo, named("CAD", SUPPORTED_IMAGE_SUFFIXES), named("Mask", SUPPORTED_IMAGE_SUFFIXES),
+            named("PartNamesToPixelMap", {".json"}), "",
+        )
+    json_paths = sorted(directory.glob("*.json"))
+    if not json_paths:
+        raise FileNotFoundError(f"No JSON part list found in {directory}")
+    groups = load_part_mapping(json_paths[0])
+    group = next(iter(groups))
+    mask = directory / group if group else None
+    if mask is None or not mask.is_file():
+        candidates = sorted(p for p in directory.iterdir() if p.is_file() and "mask" in p.stem.lower())
+        if len(candidates) != 1:
+            raise FileNotFoundError(f"Cannot uniquely resolve the part mask in {directory}")
+        mask = candidates[0]
+    cad = next((p for p in sorted(directory.glob("FG_*.*")) if p.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES), None)
+    if cad is None:
+        raise FileNotFoundError(f"No FG_* CAD image in {directory}")
+    return CaseFiles(photo, cad, mask, json_paths[0], group)
+
+
+def mask_part_ids(mask: ImageInfo, mappings: list[PartMapping]) -> np.ndarray:
+    """Scalar part-ID image from a mask: one ID channel, or exact RGB colours."""
+    array = mask.array
+    if mappings and mappings[0].color is not None:
+        if array.ndim != 3 or array.shape[2] < 3:
+            raise ValueError("The part list gives RGB colours, but the mask is not a colour image")
+        ids = np.zeros(array.shape[:2], np.uint16 if len(mappings) > 255 else np.uint8)
+        rgb = array[..., :3]
+        for part in mappings:
+            ids[np.all(rgb == part.color, axis=-1)] = part.stencil_value
+        return ids
+    if array.ndim == 2:
+        return array
+    channel = inspect_mask(mask)["selected_channel_index"]
+    if channel is None:
+        raise ValueError("Mask channels are ambiguous; refusing to guess part IDs.")
+    return array[..., int(channel)]
 
 
 def _channel_names(mode: str | None, count: int) -> list[str]:
@@ -211,64 +331,6 @@ def inspect_mask(mask: ImageInfo | np.ndarray, mode: str | None = None) -> dict[
     }
 
 
-def compare_mapping_to_mask(
-    mappings: Iterable[PartMapping], mask_inspection: dict[str, Any]
-) -> dict[str, Any]:
-    """Compare mapped scalar IDs with the safely inferred mask channel."""
-
-    counts = mask_inspection.get("selected_value_counts")
-    if counts is None:
-        raise ValueError("Mask inspection did not identify an unambiguous scalar ID channel")
-    mask_values = {int(value) for value in counts}
-    entries = list(mappings)
-    mapped_values = {entry.stencil_value for entry in entries}
-    absent = [entry for entry in entries if entry.stencil_value not in mask_values]
-    return {
-        "mapped_values": sorted(mapped_values),
-        "mask_values": sorted(mask_values),
-        "absent_mapped_parts": [asdict(entry) for entry in absent],
-        "unmapped_mask_values": sorted(mask_values - mapped_values - {0}),
-        "background_value": 0 if 0 in mask_values else None,
-    }
-
-
-def _classify_image(path: Path, resolved_masks: set[Path]) -> str:
-    if path.resolve() in resolved_masks:
-        return "part mask"
-    name = path.stem.lower()
-    if name.startswith("fg_"):
-        return "CAD reference image"
-    if name.startswith("bg_") and "testimage" in name:
-        return "additional real-world test photograph"
-    if name.startswith("bg_"):
-        return "real-world photograph"
-    return "unclassified image"
-
-
-def _resolve_mask(case_dir: Path, declared_name: str) -> tuple[Path, list[str]]:
-    declared = case_dir / declared_name
-    if declared.is_file():
-        return declared, []
-    candidates = sorted(
-        path
-        for path in case_dir.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
-        and ("mask" in path.stem.lower() or path.suffix.lower() == ".bmp")
-    )
-    if len(candidates) == 1:
-        warning = (
-            f"JSON declares mask '{declared_name}', but it is absent; resolved to the only "
-            f"mask candidate '{candidates[0].name}'."
-        )
-        return candidates[0], [warning]
-    names = ", ".join(path.name for path in candidates) or "none"
-    raise FileNotFoundError(
-        f"Declared mask '{declared_name}' is absent in {case_dir}; "
-        f"unambiguous fallback is impossible (candidates: {names})"
-    )
-
-
 def discover_case_directories(dataset_root: str | Path) -> list[Path]:
     """Return directories containing mapping JSON files."""
 
@@ -276,66 +338,3 @@ def discover_case_directories(dataset_root: str | Path) -> list[Path]:
     if not root.is_dir():
         raise NotADirectoryError(f"Dataset root is not a directory: {root}")
     return sorted({path.parent for path in root.rglob("*.json")})
-
-
-def inspect_dataset(dataset_root: str | Path) -> dict[str, Any]:
-    """Discover and inspect all JSON-defined dataset cases under a root."""
-
-    root = Path(dataset_root).resolve()
-    case_dirs = discover_case_directories(root)
-    if not case_dirs:
-        raise ValueError(f"No JSON mapping files found under dataset root: {root}")
-
-    cases: list[dict[str, Any]] = []
-    for case_dir in case_dirs:
-        json_files = sorted(case_dir.glob("*.json"))
-        case_result: dict[str, Any] = {
-            "name": "." if case_dir == root else case_dir.relative_to(root).as_posix(),
-            "directory": str(case_dir),
-            "json_files": [],
-            "images": [],
-            "warnings": [],
-        }
-        resolved_masks: set[Path] = set()
-        mask_records: list[dict[str, Any]] = []
-        for json_path in json_files:
-            mapping_groups = load_part_mapping(json_path)
-            json_record: dict[str, Any] = {"path": str(json_path), "masks": []}
-            for declared_name, mappings in mapping_groups.items():
-                mask_path, warnings = _resolve_mask(case_dir, declared_name)
-                case_result["warnings"].extend(warnings)
-                resolved_masks.add(mask_path.resolve())
-                loaded_mask = load_image(mask_path)
-                mask_stats = inspect_mask(loaded_mask)
-                comparison = compare_mapping_to_mask(mappings, mask_stats)
-                record = {
-                    "declared_mask_name": declared_name,
-                    "resolved_mask_path": str(mask_path),
-                    "parts": [asdict(entry) for entry in mappings],
-                    "inspection": mask_stats,
-                    "comparison": comparison,
-                }
-                json_record["masks"].append(record)
-                mask_records.append(record)
-            case_result["json_files"].append(json_record)
-
-        image_paths = sorted(
-            path
-            for path in case_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
-        )
-        for path in image_paths:
-            loaded = load_image(path)
-            compatible_masks = [
-                Path(record["resolved_mask_path"]).name
-                for record in mask_records
-                if loaded.width == record["inspection"]["width"]
-                and loaded.height == record["inspection"]["height"]
-            ]
-            metadata = loaded.metadata()
-            metadata["role"] = _classify_image(path, resolved_masks)
-            metadata["dimension_compatible_masks"] = compatible_masks
-            case_result["images"].append(metadata)
-        cases.append(case_result)
-
-    return {"dataset_root": str(root), "case_count": len(cases), "cases": cases}

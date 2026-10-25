@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data_inspection import discover_case_directories  # noqa: E402
+from src.data_inspection import discover_case_directories, discover_photos  # noqa: E402
 from src.detector import inspect_case, result_csv, result_json  # noqa: E402
 from src.geometric import inspect_geometry_case  # noqa: E402
 from src.reference_comparison import inspect_with_real_reference  # noqa: E402
@@ -44,176 +44,56 @@ def _save_side_by_side(result: dict, destination: Path) -> None:
     canvas.save(destination)
 
 
-def _score_rows(rows: list[dict], prediction_key: str) -> dict[str, float | int]:
-    decisive = [row for row in rows if row[prediction_key] != "UNCERTAIN"]
-    correct = [row for row in decisive if row[prediction_key] == row["manual_status"]]
-    false_positive = [
-        row for row in decisive
-        if row["manual_status"] == "MISSING" and row[prediction_key] == "PRESENT"
-    ]
-    false_negative = [
-        row for row in decisive
-        if row["manual_status"] == "PRESENT" and row[prediction_key] == "MISSING"
-    ]
-    count = len(rows)
-    return {
-        "reviewed": count,
-        "decisive": len(decisive),
-        "correct": len(correct),
-        "incorrect": len(decisive) - len(correct),
-        "uncertain": count - len(decisive),
-        "coverage_percent": 100.0 * len(decisive) / count if count else 0.0,
-        "decisive_correct_percent": 100.0 * len(correct) / len(decisive) if decisive else 0.0,
-        "false_positives": len(false_positive),
-        "false_negatives": len(false_negative),
-    }
+def _write_problem1_report(output_dir: Path, source: str) -> Path | None:
+    """Problem 1 evaluation of every checked part in every photo.
 
-
-def _write_reference_comparison_report(output_dir: Path, reference_confirmed: bool) -> Path | None:
-    """Compare unchanged human review labels against baseline and candidate rows."""
-    labels_path = output_dir / "manual_validation.csv"
-    if not labels_path.is_file():
-        LOGGER.warning("No manual_validation.csv at %s; skipping baseline comparison report.", labels_path)
-        return None
-    with labels_path.open(newline="", encoding="utf-8-sig") as source:
-        labels = list(csv.DictReader(source))
-    joined: list[dict] = []
-    for label in labels:
-        case_name = label["case"]
-        photo = label["photo"]
-        case_output = "main" if case_name == "main" else case_name
-        result_path = output_dir / "reference" / case_output / photo / "results.csv"
-        if not result_path.is_file():
-            raise FileNotFoundError(f"Missing reference comparison result for reviewed instance: {result_path}")
-        with result_path.open(newline="", encoding="utf-8-sig") as source:
-            candidates = list(csv.DictReader(source))
-        result_row = next((r for r in candidates if r["pixel_value"] == label["pixel_value"]), None)
-        if result_row is None:
-            raise ValueError(f"No mapped value {label['pixel_value']} in {result_path}")
-        joined.append({
-            **label,
-            "reference_candidate_status": result_row.get("candidate_status", "UNCERTAIN"),
-            "reference_final_status": result_row.get("status", "UNCERTAIN"),
-            "reference_similarity": result_row.get("reference_similarity", ""),
-        })
-    baseline = _score_rows(joined, "predicted_status")
-    candidate = _score_rows(joined, "reference_candidate_status")
-
-    def metric_cells(metrics: dict) -> str:
-        return (
-            f"{metrics['decisive']}/{metrics['reviewed']} | {metrics['correct']} | "
-            f"{metrics['incorrect']} | {metrics['uncertain']} | "
-            f"{metrics['coverage_percent']:.1f}% | {metrics['false_positives']} | {metrics['false_negatives']}"
-        )
-
-    lines = [
-        "# PartSight real-reference comparison",
-        "",
-        "This report evaluates the same rows in `manual_validation.csv`. Those labels are small, hand-selected visual-review labels, not official ground truth.",
-        "",
-        f"Reference completeness confirmed for this run: **{'yes' if reference_confirmed else 'no'}**.",
-        "The main case uses its configured reference photo for experimental candidate scores. The default `BG_00.png` completeness is not established. Candidate metrics below assume it is complete; the actual final status remains `UNCERTAIN` when the reference is unconfirmed. TestCase2 uses only its own case-local reference if one is explicitly configured; with none available it falls back to the existing baseline.",
-        "",
-        "Similarity is the mean of local normalized intensity correlation and gradient-magnitude correlation, after searching small translations in the CAD-aligned image coordinates. Thresholds are fixed configuration values (missing <= 0.20; present >= 0.55); they were not tuned on these labels.",
-        "",
-        "## Aggregate comparison",
-        "",
-        "| Method | Decisive / reviewed | Correct | Incorrect | Uncertain | Coverage | False positives | False negatives |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
-        f"| Existing baseline | {metric_cells(baseline)} |",
-        f"| Reference + baseline candidate (assuming reference complete) | {metric_cells(candidate)} |",
-        "",
-        "## Per photograph",
-        "",
-        "| Case / photo | Baseline decisive, correct, uncertain | Candidate decisive, correct, incorrect, uncertain | Candidate false positives / false negatives |",
-        "|---|---|---|---:|",
-    ]
-    groups: dict[tuple[str, str], list[dict]] = {}
-    for row in joined:
-        groups.setdefault((row["case"], row["photo"]), []).append(row)
-    for (case_name, photo), rows in groups.items():
-        old = _score_rows(rows, "predicted_status")
-        new = _score_rows(rows, "reference_candidate_status")
-        lines.append(
-            f"| {case_name} / {photo} | {old['decisive']}, {old['correct']}, {old['uncertain']} | "
-            f"{new['decisive']}, {new['correct']}, {new['incorrect']}, {new['uncertain']} | "
-            f"{new['false_positives']} / {new['false_negatives']} |"
-        )
-    lines.extend([
-        "",
-        "The candidate is not a reliable accuracy estimate: labels are few, selected by visual review, and the reference has not been confirmed complete. A reference-only missing score is kept `UNCERTAIN` unless the existing baseline also supports absence; a disagreement with baseline presence also becomes `UNCERTAIN`.",
-        "Geometry mode is a separate inspection and was not evaluated by these presence labels.",
-        "",
-    ])
-    report_path = output_dir / "reference_comparison_report.md"
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return report_path
-
-
-def _defect_outcome(label: dict, row: dict) -> str:
-    """DETECTED / MISSED / UNCERTAIN for one intended-defect label."""
-    outcome = row.get("inspection_outcome") or row["status"]
-    if outcome == "UNCERTAIN":
-        return "UNCERTAIN"
-    expected = "ROTATED" if label["defect_type"].startswith("rotated") else label["intended_status"]
-    return "DETECTED" if outcome == expected else "MISSED"
-
-
-def _write_intended_defect_report(output_dir: Path, reference_confirmed: bool) -> Path | None:
-    """Problem 1 evaluation against the intended test-image defects."""
+    Parts listed in ``intended_defects.csv`` take their listed status (a rotated
+    part is present); every other checked part is expected to be present.
+    Parts not visible in the CAD view are not scored.
+    """
     labels_path = output_dir / "intended_defects.csv"
-    if not labels_path.is_file():
-        LOGGER.warning("No intended_defects.csv at %s; skipping Problem 1 defect report.", labels_path)
+    source_dir = output_dir / source
+    if not labels_path.is_file() or not source_dir.is_dir():
+        LOGGER.warning("Skipping the Problem 1 report: need %s and %s.", labels_path, source_dir)
         return None
-    with labels_path.open(newline="", encoding="utf-8-sig") as source:
-        labels = list(csv.DictReader(source))
+    with labels_path.open(newline="", encoding="utf-8-sig") as handle:
+        labels = {(row["case"], row["photo"], row["pixel_value"]): row for row in csv.DictReader(handle)}
+    counts = {"CORRECT": 0, "WRONG": 0, "UNCERTAIN": 0}
+    table = []
+    for result_path in sorted(source_dir.glob("*/*/results.csv")):
+        case, photo = result_path.parent.parent.name, result_path.parent.name
+        with result_path.open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                if row["status"] == "NOT_VISIBLE":
+                    continue
+                label = labels.get((case, photo, row["pixel_value"]))
+                expected = "MISSING" if label and label["intended_status"] == "MISSING" else "PRESENT"
+                outcome = "UNCERTAIN" if row["status"] == "UNCERTAIN" else ("CORRECT" if row["status"] == expected else "WRONG")
+                counts[outcome] += 1
+                if label or outcome != "CORRECT":
+                    table.append(
+                        f"| {case} / {photo} | {row['pixel_value']} {row['part_name']} | "
+                        f"{label['defect_type'] if label else 'unchanged'} | {'ABSENT' if expected == 'MISSING' else 'PRESENT'} | "
+                        f"{'ABSENT' if row['status'] == 'MISSING' else row['status']} | {outcome} |"
+                    )
+    method = "CAD comparison (CAD image, mask, and part list only)" if source == "presence" else "known-good photo comparison"
     lines = [
-        "# PartSight Problem 1: intended test-image defects",
+        "# PartSight Problem 1: part presence results",
         "",
-        "Reference labels are the defects deliberately introduced into each test image, verified by "
-        "pixel-differencing against `BG_00.png`. Every part not listed for a photo is unchanged and must "
-        "not be flagged. Geometric validation (Problem 2) is evaluated separately.",
+        f"Method: {method}.",
+        "Expected results: the defects listed in `intended_defects.csv` (deliberate edits to the test images and the "
+        "manually reviewed TestCase2 bolts); every other checked part is expected to be present. Parts not visible in "
+        "the CAD view are not scored. These are visual-review labels, not official ground truth.",
         "",
-        f"Reference completeness confirmed for this run: **{'yes' if reference_confirmed else 'no'}**.",
+        f"Checked parts: {sum(counts.values())}. Correct: {counts['CORRECT']}. Wrong: {counts['WRONG']}. "
+        f"Uncertain: {counts['UNCERTAIN']}.",
         "",
-        "| Photo | Part | Intended | Defect | Reference result | Baseline (CAD) | Outcome |",
-        "|---|---|---|---|---|---|---|",
-    ]
-    outcomes: dict[str, int] = {}
-    false_flags: list[str] = []
-    for photo in sorted({label["photo"] for label in labels}):
-        photo_labels = [label for label in labels if label["photo"] == photo]
-        case_output = photo_labels[0]["case"]
-        result_path = output_dir / "reference" / case_output / photo / "results.csv"
-        if not result_path.is_file():
-            raise FileNotFoundError(f"Missing reference result for labelled photo: {result_path}")
-        with result_path.open(newline="", encoding="utf-8-sig") as source:
-            rows = {row["pixel_value"]: row for row in csv.DictReader(source)}
-        labelled = {label["pixel_value"] for label in photo_labels}
-        for label in photo_labels:
-            row = rows[label["pixel_value"]]
-            outcome = _defect_outcome(label, row)
-            outcomes[outcome] = outcomes.get(outcome, 0) + 1
-            shown = row.get("inspection_outcome") or row["status"]
-            lines.append(
-                f"| {photo} | {label['pixel_value']} {label['part_name']} | {label['intended_status']} | "
-                f"{label['defect_type']} | {shown} | {row['baseline_status']} | {outcome} |"
-            )
-        for value, row in rows.items():
-            flagged = (row.get("inspection_outcome") or row["status"]) in {"MISSING", "ROTATED"}
-            if value not in labelled and flagged:
-                false_flags.append(f"{photo} part {value} {row['part_name']} ({row['status']})")
-    lines += [
-        "",
-        "## Summary",
-        "",
-        ", ".join(f"{name.lower()}: {count}" for name, count in sorted(outcomes.items())) or "No labels.",
-        "",
-        f"Unchanged parts incorrectly flagged: {len(false_flags)}.",
-        *[f"- {flag}" for flag in false_flags],
+        "| Case / photo | Part | Defect | Expected | Result | Outcome |",
+        "|---|---|---|---|---|---|",
+        *table,
         "",
     ]
-    report_path = output_dir / "problem1_defect_report.md"
+    report_path = output_dir / ("problem1_report.md" if source == "presence" else "problem1_report_reference.md")
     report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
 
@@ -227,8 +107,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "inspection")
     parser.add_argument("--mode", choices=("presence", "reference", "geometry", "both", "all"), default="both")
     parser.add_argument(
-        "--alignment", choices=("sift", "loftr"), default="sift",
-        help="Alignment backend to try first. LoFTR is optional and falls back to SIFT/ECC if unavailable or rejected.",
+        "--alignment", choices=("ecc", "sift", "loftr"), default="ecc",
+        help="Photo-to-CAD alignment: ECC on edges (default; SIFT fallback), SIFT first, or optional LoFTR.",
     )
     parser.add_argument(
         "--reference-photo", default="BG_00.png",
@@ -246,10 +126,7 @@ def main() -> int:
         run_count = 0
         reference_cache: dict[tuple[str, str], dict] = {}
         for case_dir in case_dirs:
-            photos = sorted(
-                p for p in case_dir.glob("BG_*.*")
-                if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-            )
+            photos = discover_photos(case_dir)
             relative_case = case_dir.relative_to(dataset_root)
             for photo in photos:
                 # Geometry reuses the validated alignment and loaded data from
@@ -335,13 +212,11 @@ def main() -> int:
                     run_count += 1
         if run_count == 0:
             raise ValueError(f"No BG photographs found under {args.dataset_root}")
-        if args.mode in {"reference", "all"}:
-            report_path = _write_reference_comparison_report(args.output, args.reference_confirmed)
-            if report_path:
-                print(f"Saved baseline comparison report to {report_path}")
-            defect_report = _write_intended_defect_report(args.output, args.reference_confirmed)
-            if defect_report:
-                print(f"Saved Problem 1 defect report to {defect_report}")
+        for source, modes in (("presence", {"presence", "both", "all"}), ("reference", {"reference", "all"})):
+            if args.mode in modes:
+                report_path = _write_problem1_report(args.output, source)
+                if report_path:
+                    print(f"Saved Problem 1 report to {report_path}")
     except (FileNotFoundError, NotADirectoryError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
     print(f"Saved {run_count} inspection result sets under {args.output}")

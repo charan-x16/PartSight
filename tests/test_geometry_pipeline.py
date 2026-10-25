@@ -121,7 +121,7 @@ def test_selected_alignment_method_reaches_geometry_mode(monkeypatch):
 
     calls = []
 
-    def fake_inspect_case(case_dir, photo_name, *, alignment_method="sift"):
+    def fake_inspect_case(case_dir, photo_name, *, alignment_method="ecc"):
         calls.append(alignment_method)
         raise RuntimeError("stop after recording the call")
 
@@ -129,25 +129,6 @@ def test_selected_alignment_method_reaches_geometry_mode(monkeypatch):
     with pytest.raises(RuntimeError):
         geometric.inspect_geometry_case("unused", "unused.png", alignment_method="loftr")
     assert calls == ["loftr"]
-
-
-def test_ui_geometry_metrics_count_geometry_fields():
-    import app
-
-    result = {"parts": [
-        {"status": "WITHIN_TOLERANCE", "position_result": "WITHIN", "orientation_result": "NOT_OBSERVABLE", "size_result": "WITHIN"},
-        {"status": "OUT_OF_TOLERANCE", "position_result": "WITHIN", "orientation_result": "OUT", "size_result": "WITHIN"},
-        {"status": "OUT_OF_TOLERANCE", "position_result": "OUT", "orientation_result": "WITHIN", "size_result": "OUT"},
-        {"status": "NOT_MEASURABLE", "position_result": "INCONCLUSIVE", "orientation_result": None, "size_result": None},
-        {"status": "NOT_APPLICABLE", "position_result": None, "orientation_result": None, "size_result": None},
-    ]}
-
-    summary = app.geometry_summary(result)
-
-    assert summary["WITHIN_TOLERANCE"] == 1 and summary["OUT_OF_TOLERANCE"] == 2
-    assert summary["NOT_MEASURABLE"] == 1 and summary["NOT_APPLICABLE"] == 1
-    assert summary["position_out"] == 1 and summary["orientation_out"] == 1 and summary["size_out"] == 1
-    assert summary["position_inconclusive"] == 1
 
 
 def test_annotations_render_geometry_outcomes_and_violated_axes():
